@@ -86,20 +86,24 @@ class APNLayer(nn.Module):
         v = W @ tanh(x)                — value (static weight output)
         q = tanh(x)                    — query
         g = log(lam)                   — scalar decay
-        beta = eta                     — learning rate on delta term
+        beta = eta * (1 - lam) / D     — normalized learning rate
         + residual W @ tanh(x)         — static feedforward path
 
-    Update: S_t = lam * S_{t-1} + eta * (k ⊗ (v - S @ k))
+    Update: S_t = lam * S_{t-1} + eta*(1-lam)/D * (k ⊗ (v - S @ k))
     eta is a free trainable scalar (can be positive or negative).
     lam is a trainable scalar (logit-space parameterization, always in (0, 1)).
+    The (1-lam)/D normalization keeps beta small when lam≈1 or D is large.
     """
 
-    def __init__(self, d_hidden: int, lam: float = 0.99, eta: float = 0.01):
+    def __init__(self, d_hidden: int, lam: float = 0.99, eta: float = 0.01,
+                 freeze_lam: bool = False, freeze_eta: bool = False):
         super().__init__()
         self.d = d_hidden
         self.eta = nn.Parameter(torch.tensor(float(eta)))
+        self.eta.requires_grad_(not freeze_eta)
         # lam in (0,1) via sigmoid: logit(0.99) ≈ 4.595
         self.lam_logit = nn.Parameter(torch.tensor(lam).logit())
+        self.lam_logit.requires_grad_(not freeze_lam)
         self.W = nn.Linear(d_hidden, d_hidden, bias=False)
         self.o_norm = nn.LayerNorm(d_hidden)
 
@@ -121,7 +125,7 @@ class APNLayer(nn.Module):
         q = x_act.unsqueeze(2)
 
         g = lam.log().expand(B, L, 1)                            # [B, L, 1]
-        beta = self.eta.expand(B, L, 1)                           # [B, L, 1]
+        beta = (self.eta * (1 - lam) / D).expand(B, L, 1)        # [B, L, 1]
 
         o_dyn, _ = chunk_gated_delta_rule(
             q=q, k=k, v=v, g=g, beta=beta,
@@ -144,7 +148,8 @@ class SeqModel(nn.Module):
     """
 
     def __init__(self, d_input: int, d_hidden: int, n_layers: int, n_classes: int,
-                 layer_type: str = 'deltanet', apn_lam: float = 0.99, apn_eta: float = 0.01):
+                 layer_type: str = 'deltanet', apn_lam: float = 0.99, apn_eta: float = 0.01,
+                 freeze_lam: bool = False, freeze_eta: bool = False):
         super().__init__()
         self.input_proj = nn.Linear(d_input, d_hidden)
         self.layers = nn.ModuleList()
@@ -152,7 +157,8 @@ class SeqModel(nn.Module):
             if layer_type == 'deltanet':
                 self.layers.append(DeltaNetLayer(d_hidden))
             elif layer_type == 'apn':
-                self.layers.append(APNLayer(d_hidden, lam=apn_lam, eta=apn_eta))
+                self.layers.append(APNLayer(d_hidden, lam=apn_lam, eta=apn_eta,
+                                            freeze_lam=freeze_lam, freeze_eta=freeze_eta))
             else:
                 raise ValueError(f"Unknown layer_type: {layer_type}")
         self.norm = nn.LayerNorm(d_hidden)
@@ -243,6 +249,8 @@ def main():
     parser.add_argument('--n-layers', type=int, default=10)
     parser.add_argument('--apn-lam', type=float, default=0.99, help='APN decay lambda')
     parser.add_argument('--apn-eta', type=float, default=0.01, help='APN learning rate eta (init)')
+    parser.add_argument('--freeze-lam', action='store_true', help='Freeze lambda (not trainable)')
+    parser.add_argument('--freeze-eta', action='store_true', help='Freeze eta (not trainable)')
     parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--batch-size', type=int, default=64)
     parser.add_argument('--lr', type=float, default=1e-3)
@@ -278,6 +286,7 @@ def main():
         model = SeqModel(
             d_input=3, d_hidden=args.d_hidden, n_layers=args.n_layers, n_classes=10,
             layer_type=model_name, apn_lam=args.apn_lam, apn_eta=args.apn_eta,
+            freeze_lam=args.freeze_lam, freeze_eta=args.freeze_eta,
         ).to(args.device)
 
         n_params = sum(p.numel() for p in model.parameters())
