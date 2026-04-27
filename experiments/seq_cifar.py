@@ -31,7 +31,7 @@ import torchvision
 import torchvision.transforms as transforms
 
 from fla.ops.delta_rule import fused_recurrent_delta_rule
-from fla.ops.gated_delta_rule import chunk_gated_delta_rule
+from fla.ops.gated_delta_rule import fused_recurrent_gated_delta_rule
 
 
 # ---------------------------------------------------------------------------
@@ -129,10 +129,9 @@ class APNLayer(nn.Module):
         g = lam.log().expand(B, L, 1)                            # [B, L, 1]
         beta = (self.eta * (1 - lam) / D).expand(B, L, 1)        # [B, L, 1]
 
-        o_dyn, _ = chunk_gated_delta_rule(
+        o_dyn, _ = fused_recurrent_gated_delta_rule(
             q=q, k=k, v=v, g=g, beta=beta,
             scale=1.0,
-            use_qk_l2norm_in_kernel=False,
         )
 
         return self.o_norm(static_out + o_dyn.squeeze(2))
