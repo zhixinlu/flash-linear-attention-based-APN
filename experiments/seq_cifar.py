@@ -272,7 +272,9 @@ def main():
     parser.add_argument('--num-workers', type=int, default=4)
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--log-interval', type=int, default=100)
-    parser.add_argument('--save-dir', type=str, default='./outputs', help='Directory to save models and history')
+    parser.add_argument('--save-dir', type=str,
+                        default='/results' if os.path.isdir('/results') else './outputs',
+                        help='Directory to save models and history (auto-detects /results on Beaker)')
     parser.add_argument('--wandb-project', type=str, default='seq-cifar10', help='W&B project name')
     parser.add_argument('--wandb-name', type=str, default=None, help='W&B run name (auto-generated if not set)')
     parser.add_argument('--no-wandb', action='store_true', help='Disable W&B logging')
