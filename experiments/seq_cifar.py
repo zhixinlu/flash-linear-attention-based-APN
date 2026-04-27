@@ -261,6 +261,8 @@ def main():
                         help='APN learning rate eta: single value or comma-separated per-layer (e.g. 1.0 or 1.0,0.5,-0.5,...)')
     parser.add_argument('--freeze-lam', action='store_true', help='Freeze lambda (not trainable)')
     parser.add_argument('--freeze-eta', action='store_true', help='Freeze eta (not trainable)')
+    parser.add_argument('--scalar-lr', type=float, default=None,
+                        help='Separate LR for eta/lam scalars (default: same as --lr)')
     parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--batch-size', type=int, default=64)
     parser.add_argument('--lr', type=float, default=1e-3)
@@ -331,7 +333,7 @@ def main():
                 model=model_name, d_hidden=args.d_hidden, n_layers=args.n_layers,
                 n_params=n_params, n_trainable=n_trainable,
                 epochs=args.epochs, batch_size=args.batch_size,
-                lr=args.lr, weight_decay=args.weight_decay, seed=args.seed,
+                lr=args.lr, scalar_lr=args.scalar_lr or args.lr, weight_decay=args.weight_decay, seed=args.seed,
             )
             if model_name == 'apn':
                 wandb_config.update(apn_lam=args.apn_lam_list, apn_eta=args.apn_eta_list,
@@ -343,7 +345,17 @@ def main():
         save_dir = os.path.join(args.save_dir, run_tag)
         os.makedirs(save_dir, exist_ok=True)
 
-        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+        # --- Optimizer with separate LR for scalar params ---
+        scalar_names = {'eta', 'lam_logit'}
+        scalar_params = [p for n, p in model.named_parameters()
+                         if any(s in n for s in scalar_names) and p.requires_grad]
+        other_params = [p for n, p in model.named_parameters()
+                        if not any(s in n for s in scalar_names) and p.requires_grad]
+        scalar_lr = args.scalar_lr if args.scalar_lr is not None else args.lr
+        param_groups = [{'params': other_params, 'lr': args.lr}]
+        if scalar_params:
+            param_groups.append({'params': scalar_params, 'lr': scalar_lr, 'weight_decay': 0.0})
+        optimizer = torch.optim.AdamW(param_groups, lr=args.lr, weight_decay=args.weight_decay)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
         best_test_acc = 0.0
