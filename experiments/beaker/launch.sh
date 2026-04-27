@@ -28,7 +28,7 @@ gantry run \
   --priority low \
   --docker-image "$IMAGE" \
   --no-python \
-  --install "pip install --no-deps -e . && pip install 'triton>=3.3.0' 'transformers==4.46.3' einops wandb tilelang" \
+  --install "pip install --no-deps -e . && pip install 'triton>=3.3.0,<3.4.0' 'transformers==4.46.3' einops wandb" \
   --env-secret WANDB_API_KEY=WANDB_API_KEY \
   --dataset "zhixin-lu/cifar10:/data" \
   --show-logs \
