@@ -1,17 +1,21 @@
-# Beaker experiment spec for APN seq-CIFAR-10
-# Usage: beaker experiment create experiments/beaker/apn_cifar10.yaml
+# Beaker experiment spec for APN seq-CIFAR-10 (direct submission, no Gantry)
+#
+# Usage (from any machine with Beaker CLI):
+#   beaker experiment create experiments/beaker/apn_cifar10.yaml
 #
 # Before running:
-#   1. Build & push image:  beaker image create --name apn-cifar10 --workspace ai1/aihub-nd-scalempn .
-#   2. Store wandb key:     beaker secret write WANDB_API_KEY <your-key> --workspace ai1/aihub-nd-scalempn
-#   3. Submit:              beaker experiment create experiments/beaker/apn_cifar10.yaml
+#   1. Build & push image (from Mac):
+#        docker build --platform linux/amd64 -t apn-cifar10 .
+#        beaker image create apn-cifar10 --name apn-cifar10-v2 --workspace ai1/aihub-nd-scalempn
+#   2. Store wandb key:  beaker secret write WANDB_API_KEY <your-key> --workspace ai1/aihub-nd-scalempn
+#   3. Submit:           beaker experiment create experiments/beaker/apn_cifar10.yaml
 
 version: v2
-description: "APN vs DeltaNet seq-CIFAR-10 benchmark"
+description: "APN seq-CIFAR-10 on H200"
 tasks:
   - name: train-apn
     image:
-      beaker: ai1/aihub-nd-scalempn/apn-cifar10     # <-- your Beaker image name
+      beaker: zhixin-lu/apn-cifar10-v2
     command: ["python", "experiments/seq_cifar.py"]
     arguments:
       - "--model"
@@ -32,10 +36,18 @@ tasks:
       - "1e-3"
       - "--scalar-lr"
       - "1e-3"
+      - "--data-dir"
+      - "/data"
+      - "--save-dir"
+      - "/results"
       - "--wandb-project"
       - "seq-cifar10-apn"
       - "--wandb-name"
       - "apn_L10_D173_beaker"
+    datasets:
+      - source:
+          beaker: zhixin-lu/cifar10
+        mountPath: /data
     env_vars:
       - name: WANDB_API_KEY
         secret: WANDB_API_KEY
@@ -45,5 +57,5 @@ tasks:
       gpu_count: 1
     context:
       cluster: ai1/octo.hub-gcp-h200
-      priority: normal
+      priority: low
       preemptible: true

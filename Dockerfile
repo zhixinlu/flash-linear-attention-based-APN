@@ -28,6 +28,7 @@ COPY fla/ /tmp/fla/fla/
 RUN pip install --no-cache-dir --no-deps -e /tmp/fla && \
     pip install --no-cache-dir transformers einops wandb
 
-# Gantry will clone the repo to /gantry-runtime at run time,
-# so we don't bake the experiments/ code into the image.
-WORKDIR /gantry-runtime
+# Gantry will clone the repo to /gantry-runtime at run time.
+# For direct beaker submission (without Gantry), we also include experiments/.
+COPY experiments/ /app/experiments/
+WORKDIR /app
