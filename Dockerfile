@@ -23,7 +23,7 @@ RUN pip install --no-cache-dir \
     --index-url https://download.pytorch.org/whl/cu128
 
 # Install fla (no-deps to avoid re-downloading torch) + runtime deps
-COPY pyproject.toml setup.py /tmp/fla/
+COPY pyproject.toml setup.py README.md /tmp/fla/
 COPY fla/ /tmp/fla/fla/
 RUN pip install --no-cache-dir --no-deps -e /tmp/fla && \
     pip install --no-cache-dir transformers einops wandb
