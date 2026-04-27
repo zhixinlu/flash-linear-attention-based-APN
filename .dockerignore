@@ -1,9 +1,0 @@
-.git
-__pycache__
-*.pyc
-*.egg-info
-wandb/
-results/
-*.pt
-*.pth
-.ipynb_checkpoints

@@ -168,10 +168,7 @@ experiments/
 ├── README.md          # This file
 ├── seq_cifar.py       # Benchmark script (DeltaNet + APN)
 └── beaker/
-    ├── launch.sh      # One-command Gantry launcher
-    └── apn_cifar10.yaml  # Example Beaker YAML spec
-Dockerfile             # (repo root) Pre-built image for Beaker
-.dockerignore          # (repo root) Excludes .git, __pycache__, wandb/, etc.
+    └── launch.sh      # One-command Gantry launcher
 ```
 
 ---
@@ -211,56 +208,10 @@ Beaker provides H200 GPUs (143 GB VRAM, 228 KB shared memory per SM), which are 
 
 5. **Git repo** pushed to GitHub (`zhixinlu/flash-linear-attention-based-APN`) — Gantry clones from the latest commit.
 
-### Option A: Quick Launch (no Docker build needed)
+### Quick Launch
 
 Uses the public NGC PyTorch image and installs deps at runtime (~15s overhead):
 
-```bash
-gantry run --yes \
-  --workspace ai1/aihub-nd-scalempn \
-  --cluster ai1/octo.hub-gcp-h200 \
-  --gpus 1 --priority low \
-  --docker-image nvcr.io/nvidia/pytorch:24.12-py3 \
-  --no-python \
-  --install "pip install --no-deps -e . && pip install 'triton>=3.3.0' transformers einops wandb" \
-  --env-secret WANDB_API_KEY=WANDB_API_KEY \
-  --dataset "zhixin-lu/cifar10:/data" \
-  --show-logs \
-  -- python experiments/seq_cifar.py --data-dir /data \
-    --model apn --n-layers 10 --d-hidden 173 \
-    --apn-lam 0.999 --apn-eta 1.0 \
-    --epochs 200 --batch-size 64 \
-    --wandb-project seq-cifar10-apn --wandb-name apn_L10_D173_H200
-```
-
-Key flags:
-- `--docker-image nvcr.io/nvidia/pytorch:24.12-py3` — public NGC image (torch, torchvision, CUDA pre-installed)
-- `--no-python` — use the image's system Python (skip venv creation)
-- `--install` — installs fla (no-deps), triton ≥ 3.3.0, transformers, einops, wandb
-- `--dataset "zhixin-lu/cifar10:/data"` — mounts CIFAR-10 dataset at `/data`
-- `--data-dir /data` — tells seq_cifar.py where to find the data
-
-### Option B: Pre-built Image (zero install overhead)
-
-Build a Docker image with all deps baked in, then use `--beaker-image`.
-
-**Build & push** (from a machine with Docker — e.g., your Mac):
-```bash
-# On Apple Silicon, force amd64:
-docker build --platform linux/amd64 -t apn-cifar10 .
-
-# Push to Beaker:
-beaker image create apn-cifar10 --name apn-cifar10 --workspace ai1/aihub-nd-scalempn
-```
-
-If the Docker build fails with I/O errors (common with the ~9 GB NGC base image):
-```bash
-docker builder prune -af && docker system prune -af
-# Increase Docker Desktop → Settings → Resources → Virtual disk limit to 64 GB+
-docker build --platform linux/amd64 -t apn-cifar10 .
-```
-
-**Launch with pre-built image** (from HPC):
 ```bash
 ./experiments/beaker/launch.sh \
   --model apn --n-layers 10 --d-hidden 173 \
@@ -269,60 +220,27 @@ docker build --platform linux/amd64 -t apn-cifar10 .
   --wandb-project seq-cifar10-apn --wandb-name apn_L10_D173_H200
 ```
 
-Or manually:
-```bash
-gantry run --yes \
-  --workspace ai1/aihub-nd-scalempn \
-  --cluster ai1/octo.hub-gcp-h200 \
-  --gpus 1 --priority low \
-  --beaker-image ai1/aihub-nd-scalempn/apn-cifar10 \
-  --no-python \
-  --install "pip install --no-deps -e . && pip install 'triton>=3.3.0' transformers einops wandb" \
-  --env-secret WANDB_API_KEY=WANDB_API_KEY \
-  --dataset "zhixin-lu/cifar10:/data" \
-  --show-logs \
-  -- python experiments/seq_cifar.py --data-dir /data \
-    --model apn --n-layers 10 --d-hidden 173 \
-    --apn-lam 0.999 --apn-eta 1.0 \
-    --epochs 200 --batch-size 64 \
-    --wandb-project seq-cifar10-apn --wandb-name apn_L10_D173_H200
-```
+The launch script uses `gantry run` under the hood with:
+- `--docker-image nvcr.io/nvidia/pytorch:24.12-py3` — public NGC image (torch, torchvision, CUDA pre-installed)
+- `--no-python` — use the image's system Python (skip venv creation)
+- `--install` — installs fla (no-deps), triton ≥ 3.3.0, transformers==4.46.3, einops, wandb
+- `--dataset "zhixin-lu/cifar10:/data"` — mounts CIFAR-10 dataset at `/data`
 
 ### Example Experiment Commands
 
 ```bash
 # APN with large hidden dim (needs H200)
-gantry run --yes \
-  --workspace ai1/aihub-nd-scalempn \
-  --cluster ai1/octo.hub-gcp-h200 \
-  --gpus 1 --priority low \
-  --docker-image nvcr.io/nvidia/pytorch:24.12-py3 \
-  --no-python \
-  --install "pip install --no-deps -e . && pip install 'triton>=3.3.0' transformers einops wandb" \
-  --env-secret WANDB_API_KEY=WANDB_API_KEY \
-  --dataset "zhixin-lu/cifar10:/data" \
-  --show-logs \
-  -- python experiments/seq_cifar.py --data-dir /data \
-    --model apn --n-layers 10 --d-hidden 173 \
-    --apn-lam 0.999 --apn-eta 1.0 \
-    --epochs 200 --batch-size 64 \
-    --wandb-project seq-cifar10-apn --wandb-name apn_L10_D173_H200
+./experiments/beaker/launch.sh \
+  --model apn --n-layers 10 --d-hidden 173 \
+  --apn-lam 0.999 --apn-eta 1.0 \
+  --epochs 200 --batch-size 64 \
+  --wandb-project seq-cifar10-apn --wandb-name apn_L10_D173_H200
 
 # DeltaNet (D=58 matches APN D=100 in param count)
-gantry run --yes \
-  --workspace ai1/aihub-nd-scalempn \
-  --cluster ai1/octo.hub-gcp-h200 \
-  --gpus 1 --priority low \
-  --docker-image nvcr.io/nvidia/pytorch:24.12-py3 \
-  --no-python \
-  --install "pip install --no-deps -e . && pip install 'triton>=3.3.0' transformers einops wandb" \
-  --env-secret WANDB_API_KEY=WANDB_API_KEY \
-  --dataset "zhixin-lu/cifar10:/data" \
-  --show-logs \
-  -- python experiments/seq_cifar.py --data-dir /data \
-    --model deltanet --n-layers 10 --d-hidden 58 \
-    --epochs 200 --batch-size 64 \
-    --wandb-project seq-cifar10-apn --wandb-name deltanet_L10_D58_H200
+./experiments/beaker/launch.sh \
+  --model deltanet --n-layers 10 --d-hidden 58 \
+  --epochs 200 --batch-size 64 \
+  --wandb-project seq-cifar10-apn --wandb-name deltanet_L10_D58_H200
 ```
 
 ### Troubleshooting
@@ -334,7 +252,6 @@ gantry run --yes \
 | `ModuleNotFoundError: transformers` | NGC image doesn't include transformers | Add `transformers einops` to `--install` |
 | `priority ... exceeds max priority` | Workspace max is "low" | Use `--priority low` |
 | Shared memory overflow (A100) | D > 128 needs > 163 KB shared mem | Use H200 cluster (228 KB limit) |
-| Docker I/O error on Mac | NGC base ~9 GB, fills Docker disk | `docker system prune -af`, increase disk to 64 GB |
 
 ---
 
