@@ -15,7 +15,7 @@ description: "APN seq-CIFAR-10 on H200"
 tasks:
   - name: train-apn
     image:
-      beaker: zhixin-lu/apn-cifar10-v2
+      beaker: zhixin-lu/apn-cifar10-v3
     command: ["python", "experiments/seq_cifar.py"]
     arguments:
       - "--model"
