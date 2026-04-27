@@ -48,13 +48,13 @@ tasks:
       - source:
           beaker: zhixin-lu/cifar10
         mountPath: /data
-    env_vars:
+    envVars:
       - name: WANDB_API_KEY
         secret: WANDB_API_KEY
     result:
       path: /results
     resources:
-      gpu_count: 1
+      gpuCount: 1
     context:
       cluster: ai1/octo.hub-gcp-h200
       priority: low
