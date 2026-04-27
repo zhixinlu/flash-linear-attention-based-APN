@@ -17,7 +17,9 @@ Usage:
 """
 
 import argparse
+import json
 import math
+import os
 import time
 
 import torch
@@ -148,16 +150,22 @@ class SeqModel(nn.Module):
     """
 
     def __init__(self, d_input: int, d_hidden: int, n_layers: int, n_classes: int,
-                 layer_type: str = 'deltanet', apn_lam: float = 0.99, apn_eta: float = 0.01,
+                 layer_type: str = 'deltanet',
+                 apn_lam=0.99, apn_eta=0.01,
                  freeze_lam: bool = False, freeze_eta: bool = False):
         super().__init__()
+        # apn_lam / apn_eta can be a single float or a list of per-layer floats
+        if not isinstance(apn_lam, (list, tuple)):
+            apn_lam = [apn_lam] * n_layers
+        if not isinstance(apn_eta, (list, tuple)):
+            apn_eta = [apn_eta] * n_layers
         self.input_proj = nn.Linear(d_input, d_hidden)
         self.layers = nn.ModuleList()
-        for _ in range(n_layers):
+        for i in range(n_layers):
             if layer_type == 'deltanet':
                 self.layers.append(DeltaNetLayer(d_hidden))
             elif layer_type == 'apn':
-                self.layers.append(APNLayer(d_hidden, lam=apn_lam, eta=apn_eta,
+                self.layers.append(APNLayer(d_hidden, lam=apn_lam[i], eta=apn_eta[i],
                                             freeze_lam=freeze_lam, freeze_eta=freeze_eta))
             else:
                 raise ValueError(f"Unknown layer_type: {layer_type}")
@@ -247,8 +255,10 @@ def main():
     parser.add_argument('--model', type=str, default='both', choices=['deltanet', 'apn', 'both'])
     parser.add_argument('--d-hidden', type=int, default=100)
     parser.add_argument('--n-layers', type=int, default=10)
-    parser.add_argument('--apn-lam', type=float, default=0.99, help='APN decay lambda')
-    parser.add_argument('--apn-eta', type=float, default=0.01, help='APN learning rate eta (init)')
+    parser.add_argument('--apn-lam', type=str, default='0.99',
+                        help='APN decay lambda: single value or comma-separated per-layer (e.g. 0.99 or 0.99,0.95,0.9,...)')
+    parser.add_argument('--apn-eta', type=str, default='0.01',
+                        help='APN learning rate eta: single value or comma-separated per-layer (e.g. 1.0 or 1.0,0.5,-0.5,...)')
     parser.add_argument('--freeze-lam', action='store_true', help='Freeze lambda (not trainable)')
     parser.add_argument('--freeze-eta', action='store_true', help='Freeze eta (not trainable)')
     parser.add_argument('--epochs', type=int, default=50)
@@ -260,7 +270,23 @@ def main():
     parser.add_argument('--num-workers', type=int, default=4)
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--log-interval', type=int, default=100)
+    parser.add_argument('--save-dir', type=str, default='./outputs', help='Directory to save models and history')
+    parser.add_argument('--wandb-project', type=str, default='seq-cifar10', help='W&B project name')
+    parser.add_argument('--wandb-name', type=str, default=None, help='W&B run name (auto-generated if not set)')
+    parser.add_argument('--no-wandb', action='store_true', help='Disable W&B logging')
     args = parser.parse_args()
+
+    # Parse per-layer lam/eta values
+    def parse_per_layer(s, n_layers, name):
+        vals = [float(x.strip()) for x in s.split(',')]
+        if len(vals) == 1:
+            return vals * n_layers
+        if len(vals) != n_layers:
+            parser.error(f'--{name} has {len(vals)} values but --n-layers is {n_layers}')
+        return vals
+
+    args.apn_lam_list = parse_per_layer(args.apn_lam, args.n_layers, 'apn-lam')
+    args.apn_eta_list = parse_per_layer(args.apn_eta, args.n_layers, 'apn-eta')
 
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
@@ -285,15 +311,37 @@ def main():
 
         model = SeqModel(
             d_input=3, d_hidden=args.d_hidden, n_layers=args.n_layers, n_classes=10,
-            layer_type=model_name, apn_lam=args.apn_lam, apn_eta=args.apn_eta,
+            layer_type=model_name, apn_lam=args.apn_lam_list, apn_eta=args.apn_eta_list,
             freeze_lam=args.freeze_lam, freeze_eta=args.freeze_eta,
         ).to(args.device)
 
         n_params = sum(p.numel() for p in model.parameters())
-        print(f"Parameters: {n_params:,}")
+        n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"Parameters: {n_params:,} (trainable: {n_trainable:,})")
 
         if args.device == 'cuda':
             torch.cuda.reset_peak_memory_stats()
+
+        # --- W&B init (per model when running 'both') ---
+        use_wandb = not args.no_wandb
+        if use_wandb:
+            import wandb
+            run_name = args.wandb_name or f"{model_name}_L{args.n_layers}_D{args.d_hidden}"
+            wandb_config = dict(
+                model=model_name, d_hidden=args.d_hidden, n_layers=args.n_layers,
+                n_params=n_params, n_trainable=n_trainable,
+                epochs=args.epochs, batch_size=args.batch_size,
+                lr=args.lr, weight_decay=args.weight_decay, seed=args.seed,
+            )
+            if model_name == 'apn':
+                wandb_config.update(apn_lam=args.apn_lam_list, apn_eta=args.apn_eta_list,
+                                    freeze_lam=args.freeze_lam, freeze_eta=args.freeze_eta)
+            wandb.init(project=args.wandb_project, name=run_name, config=wandb_config, reinit=True)
+
+        # --- Save directory ---
+        run_tag = f"{model_name}_L{args.n_layers}_D{args.d_hidden}_s{args.seed}"
+        save_dir = os.path.join(args.save_dir, run_tag)
+        os.makedirs(save_dir, exist_ok=True)
 
         optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
@@ -308,10 +356,32 @@ def main():
             test_loss, test_acc = evaluate(model, test_loader, args.device)
             scheduler.step()
             elapsed = time.time() - t0
-            best_test_acc = max(best_test_acc, test_acc)
+            peak_mb = torch.cuda.max_memory_allocated() / 1024**2 if args.device == 'cuda' else 0.0
+            current_lr = scheduler.get_last_lr()[0]
+
+            # --- Log to W&B ---
+            if use_wandb:
+                log_dict = {
+                    'epoch': epoch,
+                    'train/loss': train_loss, 'train/acc': 100 * train_acc,
+                    'test/loss': test_loss, 'test/acc': 100 * test_acc,
+                    'lr': current_lr, 'epoch_time_s': elapsed,
+                    'peak_gpu_mb': peak_mb,
+                }
+                if model_name == 'apn':
+                    for i, layer in enumerate(model.layers):
+                        log_dict[f'apn/eta_layer{i}'] = layer.eta.item()
+                        log_dict[f'apn/lam_layer{i}'] = layer.lam.item()
+                wandb.log(log_dict, step=epoch)
+
+            # --- Save best model ---
+            if test_acc > best_test_acc:
+                best_test_acc = test_acc
+                torch.save(model.state_dict(), os.path.join(save_dir, 'best_model.pt'))
 
             history.append(dict(epoch=epoch, train_loss=train_loss, train_acc=train_acc,
-                                test_loss=test_loss, test_acc=test_acc, time=elapsed))
+                                test_loss=test_loss, test_acc=test_acc, time=elapsed,
+                                lr=current_lr, peak_gpu_mb=peak_mb))
 
             print(f"Epoch {epoch:3d}/{args.epochs} | "
                   f"train {train_loss:.4f} / {100*train_acc:.2f}% | "
@@ -319,7 +389,16 @@ def main():
                   f"best={100*best_test_acc:.2f}% | {elapsed:.1f}s")
 
             if epoch == 1 and args.device == 'cuda':
-                print(f"  >> Peak GPU memory: {torch.cuda.max_memory_allocated()/1024**2:.0f} MB")
+                print(f"  >> Peak GPU memory: {peak_mb:.0f} MB")
+
+        # --- Save final model ---
+        torch.save(model.state_dict(), os.path.join(save_dir, 'final_model.pt'))
+
+        # --- Save history ---
+        history_path = os.path.join(save_dir, 'history.json')
+        with open(history_path, 'w') as f:
+            json.dump(history, f, indent=2)
+        print(f"  Saved: {save_dir}/best_model.pt, final_model.pt, history.json")
 
         peak_mb = torch.cuda.max_memory_allocated() / 1024**2 if args.device == 'cuda' else 0.0
         total_time = sum(h['time'] for h in history)
@@ -327,6 +406,12 @@ def main():
         results[model_name] = dict(
             best_test_acc=best_test_acc, final_test_acc=test_acc, n_params=n_params,
             peak_mem_mb=peak_mb, total_time=total_time, avg_epoch_time=total_time / len(history))
+
+        if use_wandb:
+            wandb.summary['best_test_acc'] = 100 * best_test_acc
+            wandb.summary['peak_gpu_mb'] = peak_mb
+            wandb.summary['total_time_s'] = total_time
+            wandb.finish()
 
         print(f"\n  Total: {total_time:.1f}s | Peak GPU: {peak_mb:.0f} MB\n")
 
