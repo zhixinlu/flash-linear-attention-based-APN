@@ -4,8 +4,15 @@ test.py
 # data files
 data
 
-# bash scripts
+# bash scripts (except beaker launch)
 *.sh
+!experiments/beaker/*.sh
+
+# jupyter checkpoints
+.ipynb_checkpoints/
+
+# local experiment outputs
+outputs/
 
 # docs
 docs/_build
