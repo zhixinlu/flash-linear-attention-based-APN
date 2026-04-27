@@ -7,8 +7,8 @@
 #
 # Then on HPC, use:  gantry run --beaker-image ai1/aihub-nd-scalempn/apn-cifar10 ...
 #
-# Base: NGC PyTorch 24.12 = Python 3.12, CUDA 12.x, torch 2.5, torchvision, triton
-FROM nvcr.io/nvidia/pytorch:24.12-py3
+# Base: NGC PyTorch 25.04 = Python 3.12, CUDA 12.x, torch 2.7+, torchvision, triton
+FROM nvcr.io/nvidia/pytorch:25.04-py3
 
 ENV DEBIAN_FRONTEND=noninteractive
 
