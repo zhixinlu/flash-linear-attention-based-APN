@@ -1,15 +1,16 @@
-# Seq-CIFAR-10: DeltaNet vs APN Benchmark
+# Seq-CIFAR-10: DeltaNet vs APN vs Transformer Benchmark
 
 ## Overview
 
-This experiment compares two recurrent sequence models on sequential CIFAR-10 classification:
+This experiment compares three sequence models on sequential CIFAR-10 classification:
 
 - **DeltaNet** — the delta-rule linear attention model from the `fla` library
 - **APN** (Associative Plasticity Network) — a Hebbian plasticity model, mapped onto the **gated delta-rule** Triton kernel for fast GPU training
+- **Transformer** — standard softmax attention baseline using `F.scaled_dot_product_attention` (auto-dispatches to FlashAttention-2 on CUDA)
 
 The task treats each CIFAR-10 image as a sequence of 1024 RGB pixels (32×32 pixels, 3 features each). The model reads the sequence and classifies from the last time-step into one of 10 classes.
 
-Both models use the same outer architecture: `input_proj → tanh → n_layers (with residual connections) → LayerNorm → linear classifier`.
+All models use the same outer architecture: `input_proj → tanh → n_layers (with residual connections) → LayerNorm → linear classifier`.
 
 ---
 
@@ -94,6 +95,52 @@ The `chunk_gated_delta_rule` Triton kernel from `fla` avoids this by:
 
 ---
 
+## Transformer Baseline
+
+The transformer baseline is a standard pre-norm causal transformer. Each `TransformerLayer` contains:
+
+```
+LayerNorm → Multi-Head Self-Attention → residual → LayerNorm → FFN → residual
+```
+
+### Architecture Details
+
+| Component | Details |
+|---|---|
+| Attention | `F.scaled_dot_product_attention` with `is_causal=True` — auto-dispatches to FlashAttention-2 on CUDA |
+| QKV projection | Single fused `Linear(D, 3D)`, split into Q, K, V |
+| Output projection | `Linear(D, D)` |
+| FFN | `Linear(D, 4D)` → GELU → `Linear(4D, D)` |
+| Normalization | Pre-norm (LayerNorm before attention and FFN) |
+| Heads | Configurable via `--n-heads` (default: 1 for fair comparison with single-head DeltaNet/APN) |
+
+### Parameter Count Comparison
+
+The transformer has significantly more parameters per layer due to the FFN (4x expansion):
+
+| Component | DeltaNet (per layer) | APN (per layer) | Transformer (per layer) |
+|---|---|---|---|
+| Q/K/V projections | $3D^2$ | $D^2$ (W only) | $3D^2$ (fused QKV) |
+| Output projection | — | — | $D^2$ |
+| FFN | — | — | $8D^2$ (up + down) |
+| Beta projection | $D$ | — | — |
+| LayerNorm | $2D$ | $2D$ | $4D$ (two norms) |
+| Scalars | — | 2 ($\eta$, $\lambda$) | — |
+| **Total** | **$\approx 3D^2$** | **$\approx D^2$** | **$\approx 12D^2$** |
+
+At $D = 100$, 10 layers: DeltaNet ≈ 300K, APN ≈ 100K, Transformer ≈ 1.2M params (in attention/FFN only).
+
+### Complexity
+
+| Model | Time per layer | Memory |
+|---|---|---|
+| Transformer | $O(T^2 D + T D^2)$ | $O(T^2)$ per head (but FlashAttention reduces to $O(T)$ HBM) |
+| DeltaNet / APN | $O(T C D + T D^2 / C)$ | $O(D^2)$ per head + $O(C^2)$ intra-chunk |
+
+For $T = 1024$, $D = 100$: DeltaNet/APN have fewer FLOPs in the attention computation. The transformer's advantage is in mature FlashAttention kernel optimization.
+
+---
+
 ## Trainable Parameters
 
 Both $\eta$ and $\lambda$ are **trainable scalars** (one per layer):
@@ -122,9 +169,17 @@ python experiments/seq_cifar.py --model apn --n-layers 10 --d-hidden 100 \
 python experiments/seq_cifar.py --model deltanet --n-layers 10 --d-hidden 100 \
     --epochs 50 --batch-size 64
 
-# Compare both
+# Train Transformer baseline
+python experiments/seq_cifar.py --model transformer --n-layers 10 --d-hidden 100 \
+    --n-heads 4 --epochs 200 --warmup-epochs 20 --batch-size 64
+
+# Compare DeltaNet and APN
 python experiments/seq_cifar.py --model both --n-layers 10 --d-hidden 100 \
     --apn-lam 0.99 --apn-eta 1.0 --epochs 50 --batch-size 64
+
+# With learning rate warmup
+python experiments/seq_cifar.py --model apn --n-layers 10 --d-hidden 100 \
+    --apn-lam 0.999 --apn-eta 1.0 --epochs 200 --warmup-epochs 20 --batch-size 64
 
 # Freeze lambda (fixed decay, only W and eta train)
 python experiments/seq_cifar.py --model apn --n-layers 10 --d-hidden 100 \
@@ -135,14 +190,17 @@ python experiments/seq_cifar.py --model apn --n-layers 10 --d-hidden 100 \
 
 | Argument | Default | Description |
 |---|---|---|
-| `--model` | `both` | `deltanet`, `apn`, or `both` |
+| `--model` | `both` | `deltanet`, `apn`, `transformer`, or `both` (DeltaNet + APN) |
 | `--d-hidden` | `100` | Hidden dimension per layer |
-| `--n-layers` | `10` | Number of recurrent layers |
+| `--n-layers` | `10` | Number of layers |
+| `--n-heads` | `1` | Number of attention heads (transformer only; `d-hidden` must be divisible) |
 | `--apn-lam` | `0.99` | Initial $\lambda$ for APN |
 | `--apn-eta` | `0.01` | Initial $\eta$ for APN (O(1) scale is fine due to normalization) |
+| `--apn-activation` | `tanh` | Activation for APN keys/queries (`none`, `tanh`, `sigmoid`, `softsign`, `silu`, `gelu`) |
 | `--epochs` | `50` | Training epochs |
 | `--batch-size` | `64` | Batch size |
-| `--lr` | `1e-3` | Learning rate (AdamW + cosine schedule) |
+| `--lr` | `1e-3` | Learning rate (AdamW) |
+| `--warmup-epochs` | `0` | Linear warmup epochs before cosine decay |
 | `--freeze-lam` | off | Freeze $\lambda$ (not trainable) |
 | `--freeze-eta` | off | Freeze $\eta$ (not trainable) |
 
@@ -166,7 +224,7 @@ From an earlier 30-epoch run of the old APN (non-trainable $\lambda$, different 
 ```
 experiments/
 ├── README.md          # This file
-├── seq_cifar.py       # Benchmark script (DeltaNet + APN)
+├── seq_cifar.py       # Benchmark script (DeltaNet + APN + Transformer)
 └── beaker/
     └── launch.sh      # One-command Gantry launcher
 ```
@@ -241,6 +299,12 @@ The launch script uses `gantry run` under the hood with:
   --model deltanet --n-layers 10 --d-hidden 58 \
   --epochs 200 --batch-size 64 \
   --wandb-project seq-cifar10-apn --wandb-name deltanet_L10_D58_H200
+
+# Transformer baseline (with warmup)
+./experiments/beaker/launch.sh \
+  --model transformer --n-layers 10 --d-hidden 100 \
+  --n-heads 1 --epochs 200 --warmup-epochs 20 --batch-size 64 \
+  --wandb-project seq-cifar10-apn --wandb-name transformer_L10_D100_H200_warmup20
 ```
 
 ### Troubleshooting

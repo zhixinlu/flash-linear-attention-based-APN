@@ -175,6 +175,50 @@ class APNLayer(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Transformer Layer (Softmax Attention baseline)
+# ---------------------------------------------------------------------------
+
+class TransformerLayer(nn.Module):
+    """
+    Pre-norm Transformer layer using PyTorch's scaled_dot_product_attention,
+    which auto-dispatches to FlashAttention-2 on CUDA when available.
+
+    Architecture per layer: LayerNorm → MHA → residual → LayerNorm → FFN → residual
+    """
+
+    def __init__(self, d_hidden: int, n_heads: int = 1, ffn_mult: int = 4):
+        super().__init__()
+        assert d_hidden % n_heads == 0, f"d_hidden={d_hidden} not divisible by n_heads={n_heads}"
+        self.n_heads = n_heads
+        self.head_dim = d_hidden // n_heads
+        self.qkv_proj = nn.Linear(d_hidden, 3 * d_hidden, bias=False)
+        self.o_proj = nn.Linear(d_hidden, d_hidden, bias=False)
+        self.norm1 = nn.LayerNorm(d_hidden)
+        self.norm2 = nn.LayerNorm(d_hidden)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_hidden, ffn_mult * d_hidden, bias=False),
+            nn.GELU(),
+            nn.Linear(ffn_mult * d_hidden, d_hidden, bias=False),
+        )
+
+    def forward(self, x):
+        """x: [B, L, D] -> [B, L, D] (returns residual delta, outer residual added by SeqModel)"""
+        B, L, D = x.shape
+        # Pre-norm MHA
+        h = self.norm1(x)
+        qkv = self.qkv_proj(h).reshape(B, L, 3, self.n_heads, self.head_dim)
+        q, k, v = qkv.unbind(dim=2)                        # each [B, L, H, d]
+        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)  # [B, H, L, d]
+        # Uses FlashAttention-2 backend automatically on CUDA
+        attn_out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        attn_out = attn_out.transpose(1, 2).reshape(B, L, D)
+        h = self.o_proj(attn_out)
+        # Pre-norm FFN (applied to x + attn residual)
+        h = h + self.ffn(self.norm2(x + h))
+        return h
+
+
+# ---------------------------------------------------------------------------
 # Sequential Model
 # ---------------------------------------------------------------------------
 
@@ -189,7 +233,7 @@ class SeqModel(nn.Module):
                  layer_type: str = 'deltanet',
                  apn_lam=0.99, apn_eta=0.01,
                  freeze_lam: bool = False, freeze_eta: bool = False,
-                 apn_activation: str = 'tanh'):
+                 apn_activation: str = 'tanh', **kwargs):
         super().__init__()
         # apn_lam / apn_eta can be a single float or a list of per-layer floats
         if not isinstance(apn_lam, (list, tuple)):
@@ -205,6 +249,8 @@ class SeqModel(nn.Module):
                 self.layers.append(APNLayer(d_hidden, lam=apn_lam[i], eta=apn_eta[i],
                                             freeze_lam=freeze_lam, freeze_eta=freeze_eta,
                                             activation=apn_activation))
+            elif layer_type == 'transformer':
+                self.layers.append(TransformerLayer(d_hidden, n_heads=kwargs.get('n_heads', 1)))
             else:
                 raise ValueError(f"Unknown layer_type: {layer_type}")
         self.norm = nn.LayerNorm(d_hidden)
@@ -289,8 +335,9 @@ def evaluate(model, loader, device):
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Seq-CIFAR-10: DeltaNet vs APN")
-    parser.add_argument('--model', type=str, default='both', choices=['deltanet', 'apn', 'both'])
+    parser = argparse.ArgumentParser(description="Seq-CIFAR-10: DeltaNet vs APN vs Transformer")
+    parser.add_argument('--model', type=str, default='both',
+                        choices=['deltanet', 'apn', 'transformer', 'both'])
     parser.add_argument('--d-hidden', type=int, default=100)
     parser.add_argument('--n-layers', type=int, default=10)
     parser.add_argument('--apn-lam', type=str, default='0.99',
@@ -302,6 +349,8 @@ def main():
     parser.add_argument('--apn-activation', type=str, default='tanh',
                         choices=list(_ACTIVATIONS.keys()),
                         help='Activation function for APN keys/queries (default: tanh)')
+    parser.add_argument('--n-heads', type=int, default=1,
+                        help='Number of attention heads for transformer model (d_hidden must be divisible)')
     parser.add_argument('--scalar-lr', type=float, default=None,
                         help='Separate LR for eta/lam scalars (default: same as --lr)')
     parser.add_argument('--epochs', type=int, default=50)
@@ -351,6 +400,8 @@ def main():
         models_to_run.append('deltanet')
     if args.model in ('apn', 'both'):
         models_to_run.append('apn')
+    if args.model == 'transformer':
+        models_to_run.append('transformer')
 
     results = {}
     for model_name in models_to_run:
@@ -360,7 +411,7 @@ def main():
             d_input=3, d_hidden=args.d_hidden, n_layers=args.n_layers, n_classes=10,
             layer_type=model_name, apn_lam=args.apn_lam_list, apn_eta=args.apn_eta_list,
             freeze_lam=args.freeze_lam, freeze_eta=args.freeze_eta,
-            apn_activation=args.apn_activation,
+            apn_activation=args.apn_activation, n_heads=args.n_heads,
         ).to(args.device)
 
         n_params = sum(p.numel() for p in model.parameters())
@@ -386,6 +437,8 @@ def main():
                 wandb_config.update(apn_lam=args.apn_lam_list, apn_eta=args.apn_eta_list,
                                     freeze_lam=args.freeze_lam, freeze_eta=args.freeze_eta,
                                     apn_activation=args.apn_activation)
+            if model_name == 'transformer':
+                wandb_config.update(n_heads=args.n_heads)
             wandb.init(project=args.wandb_project, name=run_name, config=wandb_config, reinit=True)
 
         # --- Save directory ---
