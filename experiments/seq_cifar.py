@@ -35,6 +35,32 @@ from fla.ops.gated_delta_rule import chunk_gated_delta_rule
 
 
 # ---------------------------------------------------------------------------
+# Activation helpers
+# ---------------------------------------------------------------------------
+
+def _softsign(x: torch.Tensor) -> torch.Tensor:
+    return x / (1.0 + x.abs())
+
+
+_ACTIVATIONS = {
+    'tanh':     torch.tanh,                # bounded [-1,1], classic APN choice
+    'none':     lambda x: x,               # purely linear (identity)
+    'sigmoid':  torch.sigmoid,             # bounded [0,1]
+    'softsign': _softsign,                 # bounded [-1,1], lighter gradients than tanh
+    'silu':     F.silu,                    # unbounded, smooth; a.k.a. swish
+    'gelu':     F.gelu,                    # unbounded, smooth; standard in transformers
+}
+
+
+def get_activation(name: str):
+    """Return an activation callable by name."""
+    name = name.lower()
+    if name not in _ACTIVATIONS:
+        raise ValueError(f"Unknown activation '{name}'. Choose from: {list(_ACTIVATIONS.keys())}")
+    return _ACTIVATIONS[name]
+
+
+# ---------------------------------------------------------------------------
 # DeltaNet Layer
 # ---------------------------------------------------------------------------
 
@@ -79,17 +105,25 @@ class APNLayer(nn.Module):
     APN layer mapped onto the gated delta-rule chunk kernel.
 
     Original APN recurrence:
-        x_act = tanh(x_t)
+        x_act = act(x_t)              — activation function (default: tanh)
         h_t   = W @ x_act + M_{t-1} @ x_act
         M_t   = lam * M_{t-1} + eta * h_t @ x_act^T
 
     Mapped to gated delta-rule kernel:
-        k = tanh(x)                    — key
-        v = W @ tanh(x)                — value (static weight output)
-        q = tanh(x)                    — query
+        k = act(x)                     — key
+        v = W @ act(x)                 — value (static weight output)
+        q = act(x)                     — query
         g = log(lam)                   — scalar decay
         beta = eta * (1 - lam) / D     — normalized learning rate
-        + residual W @ tanh(x)         — static feedforward path
+        + residual W @ act(x)          — static feedforward path
+
+    Supported activations (--apn-activation):
+        tanh     — bounded [-1,1], classic APN choice (default)
+        none     — identity / purely linear
+        sigmoid  — bounded [0,1]
+        softsign — bounded [-1,1], lighter gradients than tanh
+        silu     — unbounded, smooth (a.k.a. swish)
+        gelu     — unbounded, smooth; standard in transformers
 
     Update: S_t = lam * S_{t-1} + eta*(1-lam)/D * (k ⊗ (v - S @ k))
     eta is a free trainable scalar (can be positive or negative).
@@ -98,9 +132,11 @@ class APNLayer(nn.Module):
     """
 
     def __init__(self, d_hidden: int, lam: float = 0.99, eta: float = 0.01,
-                 freeze_lam: bool = False, freeze_eta: bool = False):
+                 freeze_lam: bool = False, freeze_eta: bool = False,
+                 activation: str = 'tanh'):
         super().__init__()
         self.d = d_hidden
+        self.act_fn = get_activation(activation)
         self.eta = nn.Parameter(torch.tensor(float(eta)))
         self.eta.requires_grad_(not freeze_eta)
         # lam in (0,1) via sigmoid: logit(0.99) ≈ 4.595
@@ -118,7 +154,7 @@ class APNLayer(nn.Module):
         B, L, D = x.shape
         lam = self.lam
 
-        x_act = torch.tanh(x)                                    # [B, L, D]
+        x_act = self.act_fn(x)                                    # [B, L, D]
         static_out = self.W(x_act)                                # [B, L, D]
 
         # Kernel inputs [B, L, 1, D]
@@ -152,7 +188,8 @@ class SeqModel(nn.Module):
     def __init__(self, d_input: int, d_hidden: int, n_layers: int, n_classes: int,
                  layer_type: str = 'deltanet',
                  apn_lam=0.99, apn_eta=0.01,
-                 freeze_lam: bool = False, freeze_eta: bool = False):
+                 freeze_lam: bool = False, freeze_eta: bool = False,
+                 apn_activation: str = 'tanh'):
         super().__init__()
         # apn_lam / apn_eta can be a single float or a list of per-layer floats
         if not isinstance(apn_lam, (list, tuple)):
@@ -166,7 +203,8 @@ class SeqModel(nn.Module):
                 self.layers.append(DeltaNetLayer(d_hidden))
             elif layer_type == 'apn':
                 self.layers.append(APNLayer(d_hidden, lam=apn_lam[i], eta=apn_eta[i],
-                                            freeze_lam=freeze_lam, freeze_eta=freeze_eta))
+                                            freeze_lam=freeze_lam, freeze_eta=freeze_eta,
+                                            activation=apn_activation))
             else:
                 raise ValueError(f"Unknown layer_type: {layer_type}")
         self.norm = nn.LayerNorm(d_hidden)
@@ -261,6 +299,9 @@ def main():
                         help='APN learning rate eta: single value or comma-separated per-layer (e.g. 1.0 or 1.0,0.5,-0.5,...)')
     parser.add_argument('--freeze-lam', action='store_true', help='Freeze lambda (not trainable)')
     parser.add_argument('--freeze-eta', action='store_true', help='Freeze eta (not trainable)')
+    parser.add_argument('--apn-activation', type=str, default='tanh',
+                        choices=list(_ACTIVATIONS.keys()),
+                        help='Activation function for APN keys/queries (default: tanh)')
     parser.add_argument('--scalar-lr', type=float, default=None,
                         help='Separate LR for eta/lam scalars (default: same as --lr)')
     parser.add_argument('--epochs', type=int, default=50)
@@ -317,6 +358,7 @@ def main():
             d_input=3, d_hidden=args.d_hidden, n_layers=args.n_layers, n_classes=10,
             layer_type=model_name, apn_lam=args.apn_lam_list, apn_eta=args.apn_eta_list,
             freeze_lam=args.freeze_lam, freeze_eta=args.freeze_eta,
+            apn_activation=args.apn_activation,
         ).to(args.device)
 
         n_params = sum(p.numel() for p in model.parameters())
@@ -339,7 +381,8 @@ def main():
             )
             if model_name == 'apn':
                 wandb_config.update(apn_lam=args.apn_lam_list, apn_eta=args.apn_eta_list,
-                                    freeze_lam=args.freeze_lam, freeze_eta=args.freeze_eta)
+                                    freeze_lam=args.freeze_lam, freeze_eta=args.freeze_eta,
+                                    apn_activation=args.apn_activation)
             wandb.init(project=args.wandb_project, name=run_name, config=wandb_config, reinit=True)
 
         # --- Save directory ---
