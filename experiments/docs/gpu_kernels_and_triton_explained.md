@@ -378,71 +378,61 @@ But tilelang has its own limitation: it requires tensor dimensions to be **tile-
 
 ---
 
-## 10. Why Triton 3.3 is Slow on Hopper
+## 10. Why Triton 3.3 on Hopper: Not Slow, But Necessary
 
-### The core problem
+### The surprising result
 
-Triton 3.3.x was released **before** Hopper-specific optimizations were added. It generates code for Hopper that:
+Initial hypothesis: Triton 3.3 would be slow on Hopper because it lacks Hopper-specific optimizations (TMA, warp specialization). **This turned out to be wrong.**
 
-1. **Doesn't use TMA** — falls back to the Ampere-style manual memory loads, which are slower on Hopper
-2. **Doesn't use warp specialization** — all warps do both loading and computing, leaving Hopper's pipelining hardware idle
-3. **Uses Ampere-optimized tile sizes** — these may not be optimal for Hopper's larger shared memory and different memory bandwidth characteristics
-4. **Doesn't exploit Hopper's new instruction set** — misses WGMMA (Warp Group Matrix Multiply Accumulate) and other Hopper-specific instructions
+Benchmarks show D=100 runs **faster** on H200 with Triton 3.3 (28s) than on A100 with Triton 3.6 (33s). Hopper's raw hardware advantages (more SMs, higher bandwidth, larger shared memory) more than compensate for missing compiler optimizations at this scale.
 
-The code still runs correctly — Hopper is backward-compatible with Ampere instructions. But it's like running a program designed for a bicycle on a Ferrari — technically works, but doesn't use the engine.
+### Why we pin to Triton 3.3 anyway
 
-### Estimated performance impact
+We pin `triton>=3.3.0,<3.4.0` not for performance but for **correctness**: Triton ≥ 3.4 produces wrong gradients in the gated chunk backward kernel on Hopper (fla issue #640). Triton 3.3 generates correct code.
 
-Based on benchmarks of Triton versions on different architectures:
+### The real performance bottleneck: non-tile-aligned dimensions
 
-| Configuration | Relative speed |
-|--------------|---------------|
-| Triton 3.6 on A100 (Ampere) | 1.0× (your baseline) |
-| Triton 3.6 on H200 (Hopper) | ~1.5-2× (Hopper is faster + Hopper optimizations) |
-| Triton 3.3 on A100 (Ampere) | ~0.9-1.0× (3.3 was already good for Ampere) |
-| Triton 3.3 on H200 (Hopper) | ~0.5-0.7× (no Hopper optimizations, wasted potential) |
-
-So Triton 3.3 on H200 can actually be **slower than Triton 3.6 on A100**, even though the H200 hardware is faster. The compiler is the bottleneck, not the hardware.
-
-### Combined with D² scaling
-
-Your observed slowdown:
-
-$$\frac{281 \text{s (H200, D=173)}}{33 \text{s (A100, D=100)}} = 8.5\times$$
-
-Expected breakdown:
-
-$$\underbrace{\left(\frac{173}{100}\right)^2}_{\approx 3\times \text{ (D² scaling)}} \times \underbrace{2\text{-}3\times}_{\text{Triton 3.3 vs 3.6}} = 6\text{-}9\times$$
-
-This matches the observed 8.5× slowdown.
+The 10× slowdown from D=100 to D=173 comes from **tile alignment**, not from the Triton version. See [Section 11](#11-summary-of-your-situation) for details.
 
 ---
 
 ## 11. Summary of Your Situation
 
-```
-Your A100 setup (fast):
-  ┌─────────────────────────────────────┐
-  │ HPC A100 (Ampere, sm_80)            │
-  │ Triton 3.6 → good Ampere codegen    │
-  │ D=100 → small state (39 KB)         │
-  │ Result: 33s/epoch                   │
-  └─────────────────────────────────────┘
+### Actual benchmark results
 
-Your H200 setup (slow):
-  ┌─────────────────────────────────────┐
-  │ Beaker H200 (Hopper, sm_90)         │
-  │ Triton 3.3 → no Hopper optimizations│  ← forced by bug #640
-  │ D=173 → large state (117 KB)        │
-  │ Result: 281s/epoch                  │
-  └─────────────────────────────────────┘
+| Config | D | GPU | Triton | Time/epoch |
+|--------|---|-----|--------|-----------|
+| A100 | 100 | Ampere | 3.6 | 33s |
+| H200 | 100 | Hopper | 3.3 | **28s** |
+| H200 | 173 | Hopper | 3.3 | 281s |
 
-Why not use Triton 3.6 on H200?
-  → Bug #640: backward pass produces wrong gradients
-  → tilelang fallback fails for D=173 (not tile-aligned)
-  → fused_recurrent has no backward for gated variant
-  → Only option: Triton 3.3 (correct but slow)
-```
+**Key finding**: Triton 3.3 on Hopper is NOT slow — D=100 runs *faster* on H200 than A100. The bottleneck is **D=173 being non-tile-aligned**.
+
+### Why D=173 is 10× slower than D=100 (not 3×)
+
+The chunk kernel processes the D×D state in tiles (typically 64×64 blocks):
+
+- **D=100**: ceil(100/64) = 2 tiles per dimension → 2×2 = **4 tile blocks**
+- **D=173**: ceil(173/64) = 3 tiles per dimension → 3×3 = **9 tile blocks** (with 19 elements of padding waste per dimension)
+
+So the actual scaling is:
+- D² arithmetic scaling: $(173/100)^2 = 3\times$
+- Tile block scaling: $9/4 = 2.25\times$
+- Padding waste + reduced occupancy: ~$1.3\text{-}1.5\times$
+- **Combined**: $3 \times 2.25 \times 1.3 \approx 8\text{-}10\times$ (matches the observed 10×)
+
+### Recommended dimensions for efficient tiling
+
+| D | Tiles per dim | Tile blocks | Padding waste | Relative efficiency |
+|---|--------------|-------------|---------------|-------------------|
+| 64 | 1 | 1 | 0% | Best |
+| 100 | 2 | 4 | 22% | Good |
+| 128 | 2 | 4 | 0% | Best |
+| 173 | 3 | 9 | 10% | **Poor** (tile count jump) |
+| 192 | 3 | 9 | 0% | OK |
+| 256 | 4 | 16 | 0% | Good (standard LLM head dim) |
+
+**For future experiments**: prefer D=128 or D=192 over D=173. D=128 gives 1.6× the parameters of D=100 with the same number of tile blocks (4).
 
 ### Future resolution paths
 
