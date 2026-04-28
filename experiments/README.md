@@ -223,7 +223,7 @@ Uses the public NGC PyTorch image and installs deps at runtime (~15s overhead):
 The launch script uses `gantry run` under the hood with:
 - `--docker-image nvcr.io/nvidia/pytorch:24.12-py3` — public NGC image (torch, torchvision, CUDA pre-installed)
 - `--no-python` — use the image's system Python (skip venv creation)
-- `--install` — installs fla (no-deps), triton ≥ 3.3.0, transformers==4.46.3, einops, wandb
+- `--install` — installs fla (no-deps), triton 3.3.x (pinned <3.4 to avoid Hopper bug), transformers==4.46.3, einops, wandb
 - `--dataset "zhixin-lu/cifar10:/data"` — mounts CIFAR-10 dataset at `/data`
 
 ### Example Experiment Commands
@@ -252,13 +252,15 @@ The launch script uses `gantry run` under the hood with:
 | `ModuleNotFoundError: transformers` | NGC image doesn't include transformers | Add `transformers einops` to `--install` |
 | `priority ... exceeds max priority` | Workspace max is "low" | Use `--priority low` |
 | Shared memory overflow (A100) | D > 128 needs > 163 KB shared mem | Use H200 cluster (228 KB limit) |
+| Chunk backward crash (Hopper) | Triton ≥ 3.4 produces wrong gradients on H200/H100 (fla #640) | Pin `triton>=3.3.0,<3.4.0` |
+| `TransformGetItemToIndex` import error | transformers ≥ 4.47 requires torch ≥ 2.7 | Pin `transformers==4.46.3` |
 
 ---
 
 ## Dependencies
 
 - `fla` (flash-linear-attention) — installed in editable mode from this repo
-- PyTorch ≥ 2.0, Triton ≥ 3.3.0, torchvision
+- PyTorch ≥ 2.0, Triton ≥ 3.3.0 and < 3.4.0 (Hopper compatibility), torchvision
 - transformers, einops (required by fla layer imports)
 - wandb (experiment tracking)
 - Conda environment: `fla_apn`
