@@ -125,17 +125,22 @@ class APNLayer(nn.Module):
         silu     — unbounded, smooth (a.k.a. swish)
         gelu     — unbounded, smooth; standard in transformers
 
-    Update: S_t = lam * S_{t-1} + eta*(1-lam)/D * (k ⊗ (v - S @ k))
+    Update: S_t = lam * S_{t-1} + eta*(1-lam)/d * (k ⊗ (v - S @ k))
+    where d = D/H is the head dimension (H = number of heads).
     eta is a free trainable scalar (can be positive or negative).
     lam is a trainable scalar (logit-space parameterization, always in (0, 1)).
-    The (1-lam)/D normalization keeps beta small when lam≈1 or D is large.
+    The (1-lam)/d normalization keeps beta small when lam≈1 or d is large.
+    Multi-head: splits D into H independent heads of dimension d = D/H.
     """
 
-    def __init__(self, d_hidden: int, lam: float = 0.99, eta: float = 0.01,
+    def __init__(self, d_hidden: int, n_heads: int = 1, lam: float = 0.99, eta: float = 0.01,
                  freeze_lam: bool = False, freeze_eta: bool = False,
                  activation: str = 'tanh'):
         super().__init__()
+        assert d_hidden % n_heads == 0, f"d_hidden={d_hidden} not divisible by n_heads={n_heads}"
         self.d = d_hidden
+        self.n_heads = n_heads
+        self.head_dim = d_hidden // n_heads
         self.act_fn = get_activation(activation)
         self.eta = nn.Parameter(torch.tensor(float(eta)))
         self.eta.requires_grad_(not freeze_eta)
@@ -152,18 +157,20 @@ class APNLayer(nn.Module):
     def forward(self, x):
         """x: [B, L, D] -> [B, L, D]"""
         B, L, D = x.shape
+        H = self.n_heads
+        d = self.head_dim
         lam = self.lam
 
         x_act = self.act_fn(x)                                    # [B, L, D]
         static_out = self.W(x_act)                                # [B, L, D]
 
-        # Kernel inputs [B, L, 1, D]
-        k = x_act.unsqueeze(2)
-        v = static_out.unsqueeze(2)
-        q = x_act.unsqueeze(2)
+        # Kernel inputs [B, L, H, d]
+        k = x_act.reshape(B, L, H, d)
+        v = static_out.reshape(B, L, H, d)
+        q = x_act.reshape(B, L, H, d)
 
-        g = lam.log().expand(B, L, 1)                            # [B, L, 1]
-        beta = (self.eta * (1 - lam) / D).expand(B, L, 1)        # [B, L, 1]
+        g = lam.log().expand(B, L, H)                            # [B, L, H]
+        beta = (self.eta * (1 - lam) / d).expand(B, L, H)        # [B, L, H] — normalize by head_dim
 
         o_dyn, _ = chunk_gated_delta_rule(
             q=q, k=k, v=v, g=g, beta=beta,
@@ -171,7 +178,7 @@ class APNLayer(nn.Module):
             use_qk_l2norm_in_kernel=False,
         )
 
-        return self.o_norm(static_out + o_dyn.squeeze(2))
+        return self.o_norm(static_out + o_dyn.reshape(B, L, D))
 
 
 # ---------------------------------------------------------------------------
@@ -246,7 +253,8 @@ class SeqModel(nn.Module):
             if layer_type == 'deltanet':
                 self.layers.append(DeltaNetLayer(d_hidden))
             elif layer_type == 'apn':
-                self.layers.append(APNLayer(d_hidden, lam=apn_lam[i], eta=apn_eta[i],
+                self.layers.append(APNLayer(d_hidden, n_heads=kwargs.get('n_heads', 1),
+                                            lam=apn_lam[i], eta=apn_eta[i],
                                             freeze_lam=freeze_lam, freeze_eta=freeze_eta,
                                             activation=apn_activation))
             elif layer_type == 'transformer':
