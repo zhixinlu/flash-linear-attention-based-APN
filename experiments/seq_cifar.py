@@ -307,6 +307,8 @@ def main():
     parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--batch-size', type=int, default=64)
     parser.add_argument('--lr', type=float, default=1e-3)
+    parser.add_argument('--warmup-epochs', type=int, default=0,
+                        help='Linear warmup epochs before cosine decay (default: 0)')
     parser.add_argument('--weight-decay', type=float, default=1e-4)
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--data-dir', type=str, default='./data')
@@ -339,7 +341,7 @@ def main():
 
     print(f"Device: {args.device}")
     print(f"Config: d_hidden={args.d_hidden}, n_layers={args.n_layers}")
-    print(f"Training: epochs={args.epochs}, batch_size={args.batch_size}, lr={args.lr}\n")
+    print(f"Training: epochs={args.epochs}, batch_size={args.batch_size}, lr={args.lr}, warmup={args.warmup_epochs}\n")
 
     train_loader, test_loader = get_cifar10_loaders(
         args.batch_size, data_dir=args.data_dir, num_workers=args.num_workers)
@@ -378,6 +380,7 @@ def main():
                 n_params=n_params, n_trainable=n_trainable,
                 epochs=args.epochs, batch_size=args.batch_size,
                 lr=args.lr, scalar_lr=args.scalar_lr or args.lr, weight_decay=args.weight_decay, seed=args.seed,
+                warmup_epochs=args.warmup_epochs,
             )
             if model_name == 'apn':
                 wandb_config.update(apn_lam=args.apn_lam_list, apn_eta=args.apn_eta_list,
@@ -401,7 +404,15 @@ def main():
         if scalar_params:
             param_groups.append({'params': scalar_params, 'lr': scalar_lr, 'weight_decay': 0.0})
         optimizer = torch.optim.AdamW(param_groups, lr=args.lr, weight_decay=args.weight_decay)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+        if args.warmup_epochs > 0:
+            warmup_sched = torch.optim.lr_scheduler.LinearLR(
+                optimizer, start_factor=1e-6 / args.lr, total_iters=args.warmup_epochs)
+            cosine_sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=args.epochs - args.warmup_epochs)
+            scheduler = torch.optim.lr_scheduler.SequentialLR(
+                optimizer, schedulers=[warmup_sched, cosine_sched], milestones=[args.warmup_epochs])
+        else:
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
         best_test_acc = 0.0
         history = []
