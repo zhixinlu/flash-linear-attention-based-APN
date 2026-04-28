@@ -20,6 +20,14 @@ This document explains the full stack — from how GPUs execute math, to what Tr
 
 ---
 
+## TL;DR — Where the Speedup Comes From
+
+The speedup comes from two separate ideas. First, FLA/Triton replaces a Python loop over 1024 timesteps with a small number of large GPU kernels, removing thousands of launch boundaries and making memory access predictable. Second, the delta-rule/chunk algorithm avoids saving a full $D \times D$ matrix state for every timestep. In the recurrent form, a kernel keeps only the current state tile on chip while scanning time. In the chunkwise form, the algorithm builds compact per-chunk representations and runs the remaining recurrence over chunk boundaries. For $T=1024, C=64$, that means 16 chunk-level recurrent steps instead of 1024 timestep-level state materializations.
+
+In this experiment, the DeltaNet baseline uses FLA's fused recurrent delta-rule kernel (`fused_recurrent_delta_rule`). The APN-mapped model uses FLA's chunked gated-delta-rule operator (`chunk_gated_delta_rule`). It is one high-level PyTorch operation, but internally it launches several Triton kernels to compute gates, chunk-local WY/triangular terms, chunk boundary states, and outputs. The APN experiment is a kernel-compatible APN mapping — it preserves the idea of a fast plastic matrix and a static residual path, but the dynamic update is the gated delta rule (which includes an erase/error term $v_t - S_{t-1}k_t$), not the exact original APN Hebbian outer-product rule.
+
+---
+
 ## 1. What is a GPU Kernel?
 
 A **kernel** is a small program that runs on the GPU. When you write PyTorch code like:
@@ -100,11 +108,13 @@ Each SM (Streaming Multiprocessor) on the GPU has a fixed amount of shared memor
 | H100 | Hopper (sm_90) | **228 KB** |
 | H200 | Hopper (sm_90) | **228 KB** |
 
-This is why **D=173 can't run on A100 but works on H200**: the chunk kernel needs to hold a D×D tile in shared memory during the intra-chunk computation. For D=173 in float32:
+This is relevant to understanding **D=173 performance on different GPUs**. The chunk kernel needs to work with D×D state tiles during intra-chunk computation. For D=173 in float32:
 
-$$173 \times 173 \times 4 \text{ bytes} = 119{,}716 \text{ bytes} \approx 117 \text{ KB}$$
+$$173 \times 173 \times 4 \text{ bytes} = 119{,}716 \text{ bytes} \approx 117 \text{ KiB}$$
 
-With additional workspace (indices, accumulators, etc.), this exceeds A100's 164 KB limit but fits within H200's 228 KB.
+A full $D \times D$ fp32 tile alone fits under A100's 164 KB per-SM shared-memory maximum. However, whether the kernel fits depends on padded tile sizes, extra workspaces, compiler allocation, register pressure, occupancy, and whether the generated kernel actually places that tile in shared memory rather than registers. For D=173, kernels often pad/tile dimensions to powers of two or block multiples (e.g., 192 or 256 in one dimension), which can cause performance cliffs.
+
+Hopper's larger shared-memory budget (228 KB) helps some large-tile kernels, but the D=173 behavior should not be explained only by $D^2$ state size. The slowdown can also come from padding, extra tiles, lower occupancy, register pressure, less favorable tensor-core tile shapes, and fallback code paths.
 
 For D=100:
 
@@ -206,26 +216,33 @@ for t in range(1024):      # Sequential loop in Python
 1. **1024 × 7 = 7168 kernel launches** — each has ~10μs overhead = 72ms just in launch overhead
 2. **M (D×D) is read/written to HBM every timestep** — 1024 × 2 × D² × 4 bytes of HBM traffic
 3. **Python loop** — the CPU sends one kernel at a time, GPU idles between launches
-4. **Backpropagation** — PyTorch must save all 1024 intermediate M matrices (1024 × D × D × 4 bytes) for the backward pass. For D=173, that's **1024 × 173 × 173 × 4 = 123 MB per layer**, and with 10 layers = **1.2 GB** just for storing intermediate states.
+4. **Backpropagation** — PyTorch must save all 1024 intermediate M matrices for every sample in the batch. For B=64, D=173, T=1024, 10 layers:
+   $$B \times T \times D^2 \times 4 \text{ bytes} \times L = 64 \times 1024 \times 173^2 \times 4 \times 10 \approx 78.5 \text{ GB}$$
+   For D=100 the same formula gives ~26.2 GB. This is consistent with the repo README's rough ~26 GB statement. (Note: the per-layer, per-sample cost is $T \times D^2 \times 4 = 123$ MB for D=173, but the full cost must include batch size and layer count.)
 
 ### The fused kernel APN
 
-The `chunk_gated_delta_rule` kernel does the **entire recurrence** in a single kernel launch:
+Compared with the naive APN loop, `chunk_gated_delta_rule` greatly reduces launch overhead because it replaces per-timestep Python operations with a small number of large Triton kernels. It is not one monolithic CUDA kernel; it is a compact kernel pipeline designed so large matrix/tensor operations run efficiently and dense timestep states are not materialized in HBM.
 
 ```
-One kernel launch:
+A small number of Triton kernel launches:
   - Load q, k, v, g, beta from HBM
-  - Compute the full 1024-step recurrence on-chip
+  - Compute intra-chunk WY/triangular terms (parallel within chunks)
+  - Propagate state across chunk boundaries (16 sequential steps for T=1024, C=64)
   - Write output o back to HBM
 ```
 
 **Improvements:**
-1. **1 kernel launch** instead of 7168
-2. **State matrix stays in shared memory / registers** — never touches HBM between timesteps
+1. **A handful of kernel launches** instead of 7168 — massive reduction in launch overhead
+2. **State tiles stay on chip within kernels** — a fused recurrent kernel keeps the current recurrent state tile in registers/SRAM while scanning timesteps. It does not store all batch elements, all layers, or all timesteps in one shared-memory array. The state is partitioned across Triton programs; each program owns one batch/head/tile of the state, updates that tile for all timesteps, and writes outputs to HBM. Between timesteps, the current state tile avoids a global-memory round trip.
 3. **No Python loop** — the GPU does the entire computation autonomously
 4. **Smart backward pass** — the chunk method avoids storing all intermediate states (see next section)
 
 This is why the kernel-based APN is **10-100× faster** than the naive version.
+
+> **Note on the APN mapping:** The APN experiment is a kernel-compatible APN mapping. It preserves the idea of a fast plastic matrix and a static residual path, but the dynamic update is the gated delta rule:
+> $$S_t = \lambda \, S_{t-1} + \beta \cdot k_t (v_t - S_{t-1} k_t)^T$$
+> This includes an erase/error term $(v_t - S_{t-1}k_t)$, which differs from the exact original APN Hebbian outer-product rule $M_t = \lambda M_{t-1} + \eta \, h_t \, x_t^T$.
 
 ---
 
@@ -283,12 +300,13 @@ For LLM training with T=2048 or longer, the chunk method is significantly faster
 
 ### Memory advantage for backpropagation
 
-During the backward pass, you need the intermediate state $S_t$ to compute gradients. The naive approach stores all T states. The chunk method only stores states at **chunk boundaries** (T/C states), reducing memory by a factor of C=64:
+During the backward pass, you need the intermediate state $S_t$ to compute gradients. The naive approach stores all T states for every batch item. The chunk method does not store $S_t$ for every timestep. It constructs compact per-chunk representations, computes chunk boundary states over only 16 chunks (for $T=1024, C=64$), and reconstructs or recomputes needed intermediate quantities during backward. This is why it saves memory compared with the naive APN loop.
 
-- Naive backward: store 1024 states × D² × 4 bytes = 123 MB (for D=173)
-- Chunk backward: store 16 states × D² × 4 bytes ≈ 2 MB (for D=173)
+The actual FLA implementation is more subtle than simply saving one dense boundary-state table: it saves compact representations and recomputes some intermediate states in backward rather than materializing all of them.
 
-This is why you saw 2 GB GPU memory for 10-layer APN instead of the 26 GB a naive implementation would need.
+For the full naive cost with B=64, D=173, T=1024, 10 layers: ~78.5 GB (see Section 6). The chunk method reduces this dramatically by avoiding per-timestep state storage.
+
+This is why you saw 2 GB GPU memory for 10-layer APN instead of the tens of GB a naive implementation would need.
 
 ---
 
@@ -356,7 +374,7 @@ Triton 3.4.0 added Hopper-specific optimizations — TMA instructions, warp spec
 
 For the specific kernel `chunk_bwd_dqkwg` (the backward pass of the gated chunk kernel), Triton 3.4+ generates code that **produces numerically incorrect results** on Hopper GPUs. The issue is tracked as [fla issue #640](https://github.com/fla-org/flash-linear-attention/issues/640).
 
-The likely cause is a bug in Triton's code generation for one of:
+The Triton version pin is an empirical compatibility workaround. It avoids a known class of precision/correctness failures observed in FLA gated-delta chunk kernels on Hopper-family hardware with newer Triton versions. The exact compiler-level cause should be treated as unknown unless verified with the issue discussion or generated-kernel analysis. Possible causes include:
 - Register spilling (when there aren't enough registers, data is temporarily saved to local memory — if the spill/reload order is wrong, data gets corrupted)
 - Memory barrier placement (on Hopper, TMA operations are asynchronous — if the compiler doesn't insert proper synchronization barriers, a compute warp might read data before TMA finishes writing it)
 - Instruction scheduling (reordering operations in a way that's valid on Ampere but not on Hopper due to the different memory model)
