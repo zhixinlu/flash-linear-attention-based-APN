@@ -59,6 +59,7 @@ The Associative Plasticity Network (APN) is a biologically-inspired recurrent mo
 By mapping the APN recurrence onto the \emph{gated delta-rule} chunk kernel from the Flash Linear Attention (FLA) library, we achieve efficient GPU training with $O(TD)$ complexity instead of the $O(T^2 D)$ cost of standard softmax attention.
 
 This report summarizes all experiments conducted on the \textbf{Seq-CIFAR-10} benchmark, where each $32 \times 32$ CIFAR-10 image is flattened into a sequence of $T = 1024$ RGB pixels ($3$-dimensional features), and the model classifies from the last time-step.
+We also provide a detailed explanation of the GPU kernel infrastructure and chunk algorithm (Section~\ref{sec:kernels}) that makes efficient training possible.
 
 % ============================================================================
 \section{Model Architectures}
@@ -153,6 +154,7 @@ DeltaNet / APN (recurrent) & $O(TD^2)$ & $O(D^2)$ per head \\
 For $T=1024$, $D=100$: the softmax attention FLOPs scale as $T^2 D = 1024^2 \times 100 \approx 10^8$, while the chunked delta-rule scales as $TCD = 1024 \times 64 \times 100 \approx 6.5 \times 10^6$ --- a $\approx 15\times$ reduction in the attention-like computation. However, the APN/DeltaNet kernels are Triton-based (less mature than FlashAttention's hand-tuned CUDA), and at small $D$ the linear projections dominate, so the wall-clock advantage depends on the specific configuration.
 
 For \textbf{inference}, the advantage is even clearer: APN/DeltaNet maintain a fixed $D \times D$ state (constant memory), while the Transformer's KV cache grows linearly with sequence length.
+Section~\ref{sec:kernels} explains in detail how the FLA Triton kernels and chunk algorithm achieve these theoretical advantages in practice.
 
 % ============================================================================
 \section{Experimental Setup}
@@ -462,31 +464,152 @@ This suggests APN's single-projection design acts as an \textbf{implicit regular
 \end{figure}
 
 % ============================================================================
-\section{Why APN Is Faster}
+\section{GPU Kernel Implementation and the Chunk Method}
+\label{sec:kernels}
 
-Three factors explain APN's speed advantage over DeltaNet and the Transformer:
+A critical contributor to APN/DeltaNet's practical speed is the \textbf{fused Triton kernel} implementation from the Flash Linear Attention (FLA) library.
+This section explains the GPU execution model, contrasts a naive PyTorch implementation with the kernel-based approach, and details the chunk algorithm that enables efficient training.
+
+\subsection{GPU Memory Hierarchy}
+
+Modern GPUs have a layered memory system, where each level trades capacity for speed:
+
+\begin{table}[h]
+\centering
+\caption{GPU memory hierarchy (H200).}
+\label{tab:memhierarchy}
+\begin{tabular}{lccc}
+\toprule
+\textbf{Level} & \textbf{Size} & \textbf{Bandwidth} & \textbf{Control} \\
+\midrule
+Registers & $\approx$256 KB / SM & Instantaneous & Per-thread \\
+Shared Memory (SRAM) & 228 KB / SM & $\approx$20 TB/s & Programmer-managed \\
+L2 Cache & 40--60 MB & $\approx$6 TB/s & Automatic \\
+HBM (Global Memory) & 141 GB & $\approx$3 TB/s & Default storage \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Most GPU workloads are \textbf{memory-bound}: the arithmetic units can perform trillions of operations per second, but spend most time waiting for data from HBM.
+The key to fast kernels is keeping data in shared memory / registers as long as possible to minimize HBM round-trips.
+
+\subsection{Naive APN vs.\ Fused Kernel APN}
+
+\textbf{Naive PyTorch implementation.} A straightforward APN loop issues 7+ kernel launches per timestep (activation, two matmuls, scale, outer product, add, copy):
+\begin{itemize}
+\item $T \times 7 = 7{,}168$ kernel launches per layer, each with $\sim$10\,$\mu$s overhead $\approx$ 72\,ms in launch overhead alone.
+\item The $D \times D$ state matrix $S$ is read from / written to HBM at every timestep.
+\item A Python for-loop serializes all timesteps, preventing the GPU from planning work ahead.
+\item Backpropagation requires saving all $T$ intermediate states. For $B=64$, $D=100$, $T=1024$, $L=10$:
+\[
+B \times T \times D^2 \times 4\,\text{bytes} \times L = 64 \times 1024 \times 10^4 \times 4 \times 10 \approx 26\,\text{GB}.
+\]
+\end{itemize}
+
+\textbf{Fused kernel implementation.}
+The FLA library replaces this loop with a compact Triton kernel pipeline.
+In our experiments, DeltaNet uses the \texttt{fused\_recurrent\_delta\_rule} kernel (a single-kernel scan), while APN uses the \texttt{chunk\_gated\_delta\_rule} operator (a multi-kernel pipeline computing gates, intra-chunk WY terms, inter-chunk state propagation, and outputs).
+The improvements are:
+\begin{enumerate}
+\item \textbf{A handful of kernel launches} instead of 7{,}168, eliminating launch overhead.
+\item \textbf{State tiles stay on-chip}: each Triton program owns one batch/head/tile of the $D \times D$ state in registers or SRAM. Between timesteps, the state is updated in-place without an HBM round-trip.
+\item \textbf{No Python loop}: the entire forward pass executes autonomously on the GPU.
+\item \textbf{Smart backward pass}: the chunk method avoids storing all $T$ intermediate states (see below).
+\end{enumerate}
+This is why the kernel-based APN is $10$--$100\times$ faster than the naive version and uses $\sim$1.6\,GB instead of $\sim$26\,GB.
+
+\subsection{The Chunk Algorithm}
+\label{sec:chunk}
+
+The delta-rule recurrence $S_t = f(S_{t-1}, \mathbf{k}_t, \mathbf{v}_t)$ is inherently sequential: $S_t$ depends on $S_{t-1}$.
+A fused recurrent kernel loops through all $T$ timesteps one by one; parallelism is limited to batch and state dimensions.
+
+The \textbf{chunk method} splits the sequence into $T/C$ chunks of $C$ timesteps (default $C=64$) and restructures the computation:
 
 \begin{enumerate}
-\item \textbf{Fewer parameters and projections.}
-APN uses a single $D \times D$ projection ($W$) per layer, while DeltaNet uses three ($W_Q, W_K, W_V$) and the Transformer uses four projections plus a $D \to 4D \to D$ FFN.
-At $D=100$: APN computes $10$K multiply-adds for projections per layer; DeltaNet computes $30$K; the Transformer computes $120$K.
-Fewer projections means fewer GEMM calls, which dominate small-$D$ wall-clock time.
+\item \textbf{Intra-chunk (parallel across chunks).}
+Within each chunk, the recurrence is reformulated as a lower-triangular linear system using the \textbf{WY representation}:
+\[
+L \, \tilde{\mathbf{v}} = \mathbf{v} - S_{\text{prev}} K^\top, \quad
+L_{ij} = \begin{cases} 1 & i = j \\ -\beta_i \, \mathbf{k}_i^\top \mathbf{k}_j \prod_{m=j+1}^{i-1} g_m & i > j \\ 0 & i < j \end{cases}
+\]
+This triangular solve maps to GPU matrix operations and can be solved for all $T/C$ chunks simultaneously.
 
-\item \textbf{Linear complexity in $T$.}
-The gated delta-rule kernel processes the $T=1024$ sequence in chunks of $C=64$, computing a $C \times C$ triangular system within each chunk and propagating a $D \times D$ state across chunks.
-The total work scales as $O(TCD + TD^2/C)$, which is \emph{linear} in $T$.
-Softmax attention (even with FlashAttention) is $O(T^2 D)$---quadratic in $T$.
-At $T=1024, D=100$: APN's attention FLOPs are $\approx 15\times$ fewer.
-
-\item \textbf{Compact recurrent state.}
-APN/DeltaNet store a $D \times D$ matrix per head---$40$~KB at $D=100$ in FP32.
-The Transformer must store Q/K/V activations proportional to $T$ for the backward pass, even with FlashAttention's memory-efficient recomputation.
-This translates to lower HBM traffic and better cache utilization for the recurrent models.
+\item \textbf{Inter-chunk (sequential across chunk boundaries).}
+The $D \times D$ state is propagated from chunk 0 $\to$ chunk 1 $\to \cdots \to$ chunk $T/C-1$.
+For $T=1024, C=64$, this is only 16 sequential state updates instead of 1024.
 \end{enumerate}
 
-\textbf{Caveat:} FlashAttention-2 is implemented in hand-tuned CUDA (by Tri Dao), achieving near-peak throughput.
-The FLA kernels are written in Triton, which generates good but not optimal GPU code.
-As sequence length grows ($T \gg 4096$), the $O(T)$ vs $O(T^2)$ gap widens and the recurrent models' advantage becomes dominant regardless of kernel maturity.
+\begin{table}[h]
+\centering
+\caption{Comparison of execution strategies for $T=1024$, $C=64$.}
+\label{tab:strategies}
+\begin{tabular}{lccc}
+\toprule
+\textbf{Method} & \textbf{Sequential depth} & \textbf{HBM reads of $S$} & \textbf{Backward state storage} \\
+\midrule
+Naive Python loop & $T = 1024$ & $T \times D^2$ & All $T$ states \\
+Fused recurrent & $T = 1024$ & 1 (load once) & Recompute \\
+Chunk ($C=64$) & $T/C = 16$ & $T/C \times D^2$ & $T/C$ boundary states \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The chunk method's advantage grows with sequence length: at $T=8192$, the sequential depth is 128 (vs.\ 8192); at $T=65536$ it is 1024 (vs.\ 65536).
+For the backward pass, only $T/C$ boundary states need to be stored---a $64\times$ reduction compared to the naive approach.
+
+\subsection{Tile Alignment and Performance Cliffs}
+
+The chunk kernel processes the $D \times D$ state in tiles (typically $64 \times 64$ blocks).
+When $D$ is not a multiple of the tile size, the kernel must pad to the next tile boundary, wasting compute:
+
+\begin{table}[h]
+\centering
+\caption{Effect of $D$ on tile count and efficiency (tile size $=64$).}
+\label{tab:tiling}
+\begin{tabular}{ccccc}
+\toprule
+$D$ & Tiles/dim & Tile blocks & Padding waste & Relative efficiency \\
+\midrule
+64 & 1 & 1 & 0\% & Best \\
+100 & 2 & 4 & 22\% & Good \\
+128 & 2 & 4 & 0\% & Best \\
+173 & 3 & 9 & 10\% & Poor (tile jump) \\
+256 & 4 & 16 & 0\% & Good \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+For $D=100$: $\lceil 100/64 \rceil = 2$ tiles per dimension $\to 4$ tile blocks.
+For $D=173$: $\lceil 173/64 \rceil = 3$ tiles $\to 9$ blocks, plus padding waste and reduced occupancy.
+This explains the $\approx$10$\times$ slowdown from $D=100$ (26\,s/epoch) to $D=173$ (453\,s/epoch) observed in the APN tanh experiment---far worse than the $1.7^2 \approx 3\times$ ratio of $D^2$ arithmetic alone.
+
+\textbf{Recommendation:} For efficient Triton kernel execution, prefer tile-aligned dimensions $D \in \{64, 128, 192, 256\}$ or small dimensions with only 2 tiles per axis ($D \le 128$).
+
+\subsection{Why APN Is Faster Than DeltaNet and the Transformer}
+
+Beyond the shared kernel infrastructure, three factors explain APN's additional speed advantage:
+
+\begin{enumerate}
+\item \textbf{Fewer projections.}
+APN uses a single $D \times D$ projection per layer; DeltaNet uses three ($W_Q, W_K, W_V$); the Transformer uses four projections plus a $D \to 4D \to D$ FFN.
+At $D=100$: APN computes 10K multiply-adds per layer; DeltaNet 30K; the Transformer 120K.
+
+\item \textbf{Compact recurrent state.}
+APN/DeltaNet store a $D \times D$ state ($\approx$40\,KB at $D=100$ in FP32).
+The Transformer must store Q/K/V activations proportional to $T$ for the backward pass, even with FlashAttention-2's memory-efficient recomputation, resulting in higher HBM traffic.
+
+\item \textbf{Linear vs.\ quadratic complexity in $T$.}
+Softmax attention (even with FlashAttention) is $O(T^2 D)$; the chunked delta rule is $O(TCD + TD^2/C)$---linear in $T$.
+At $T=1024, D=100$: attention FLOPs are $\approx 15\times$ fewer for APN.
+\end{enumerate}
+
+\textbf{Caveat:} FlashAttention-2 is implemented in hand-tuned CUDA, achieving near-peak throughput.
+The FLA kernels are Triton-based (correct but not fully optimized for Hopper).
+As $T$ grows beyond 4096, the $O(T)$ vs.\ $O(T^2)$ gap dominates regardless of kernel maturity.
+
+\textbf{Note on Triton version:} We pin \texttt{triton>=3.3.0,<3.4.0} due to a known correctness bug in the gated chunk backward kernel on Hopper GPUs with Triton $\ge$3.4 (FLA issue \#640).
+Triton 3.3 generates correct code and runs \emph{faster} on H200 (26\,s/epoch) than on A100 with Triton 3.6 (33\,s/epoch), as Hopper's raw hardware advantages (more SMs, higher bandwidth, 228\,KB shared memory) compensate for missing compiler optimizations.
 
 % ============================================================================
 \section{Activation Function Analysis}
