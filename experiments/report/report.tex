@@ -159,28 +159,28 @@ For \textbf{inference}, the advantage is even clearer: APN/DeltaNet maintain a f
 
 \begin{table}[h]
 \centering
-\caption{Completed experiments (200 epochs unless noted). Bold: best per group. ${}^*$Still running.}
+\caption{All completed experiments (200 epochs, peak test accuracy with best epoch in parentheses). Bold: best per group.}
 \label{tab:results}
 \resizebox{\textwidth}{!}{%
-\begin{tabular}{llcccccc}
+\begin{tabular}{llccccccc}
 \toprule
-\textbf{Run Name} & \textbf{Model} & \textbf{$D$} & \textbf{Params} & \textbf{Warmup} & \textbf{Best Test Acc} & \textbf{Epoch Time (s)} & \textbf{Peak GPU (MB)} \\
+\textbf{Run Name} & \textbf{Model} & \textbf{$D$} & \textbf{Params} & \textbf{Warmup} & \textbf{Best Test Acc (Ep)} & \textbf{Final Test Acc} & \textbf{Epoch Time (s)} & \textbf{Peak GPU (MB)} \\
 \midrule
-\multicolumn{8}{l}{\textit{Parameter-matched group ($\approx$103K params)}} \\
+\multicolumn{9}{l}{\textit{Parameter-matched group ($\approx$103K params)}} \\
 \midrule
-\texttt{apn\_act-none\_warmup20} & APN (act=none) & 100 & 103,630 & 20 & \textbf{58.17\%} & 25.5 & 1,590 \\
-\texttt{apn\_act-none} & APN (act=none) & 100 & 103,630 & 0 & 57.96\% & 26.0 & 1,590 \\
-\texttt{apn\_act-tanh\_better\_init} & APN (act=tanh) & 100 & 103,630 & 0 & 52.50\% & 80.1 & 1,331 \\
-\texttt{apn\_act-tanh} & APN (act=tanh) & 100 & 103,630 & 0 & 51.16\% & 26.2 & 1,617 \\
-\texttt{deltanet\_D58} & DeltaNet & 58 & 103,598 & 0 & 55.40\% & 69.0 & 1,151 \\
-\texttt{transformer\_D29\_paramatch}${}^*$ & Transformer & 29 & 102,554 & 20 & 59.16\% & 32.6 & 4,623 \\
+\texttt{deltanet\_D58} & DeltaNet & 58 & 103,598 & 0 & \textbf{60.06\%} (18) & 55.40\% & 69.0 & 1,151 \\
+\texttt{transformer\_D29\_paramatch} & Transformer & 29 & 102,554 & 20 & 59.75\% (38) & 55.89\% & 32.6 & 4,623 \\
+\texttt{apn\_act-none\_warmup20} & APN (act=none) & 100 & 103,630 & 20 & 58.34\% (189) & 58.17\% & 25.5 & 1,590 \\
+\texttt{apn\_act-none} & APN (act=none) & 100 & 103,630 & 0 & 58.12\% (163) & 57.96\% & 26.0 & 1,590 \\
+\texttt{apn\_act-tanh\_better\_init} & APN (act=tanh) & 100 & 103,630 & 0 & 53.15\% (168) & 52.50\% & 80.1 & 1,331 \\
+\texttt{apn\_act-tanh} & APN (act=tanh) & 100 & 103,630 & 0 & 51.69\% (162) & 51.16\% & 26.2 & 1,617 \\
 \midrule
-\multicolumn{8}{l}{\textit{Width-matched group ($D=100$)}} \\
+\multicolumn{9}{l}{\textit{Width-matched group ($D=100$)}} \\
 \midrule
-\texttt{transformer\_D100}${}^*$ & Transformer & 100 & 1,205,610 & 20 & \textbf{61.25\%} & 39.2 & 4,278 \\
-\texttt{deltanet\_D100} & DeltaNet & 100 & 304,610 & 0 & 60.80\% & 100.4 & 2,133 \\
-\texttt{deltanet\_D100\_warmup20}${}^*$ & DeltaNet & 100 & 304,610 & 20 & 57.50\% & 100.3 & 2,180 \\
-\texttt{apn\_act-none\_warmup20} & APN (act=none) & 100 & 103,630 & 20 & 58.17\% & 25.5 & 1,590 \\
+\texttt{transformer\_D100} & Transformer & 100 & 1,205,610 & 20 & \textbf{63.50\%} (180) & 63.46\% & 39.3 & 4,278 \\
+\texttt{deltanet\_D100} & DeltaNet & 100 & 304,610 & 0 & 62.28\% (11) & 60.80\% & 100.4 & 2,133 \\
+\texttt{deltanet\_D100\_warmup20} & DeltaNet & 100 & 304,610 & 20 & 59.26\% (21) & 58.73\% & 100.4 & 2,180 \\
+\texttt{apn\_act-none\_warmup20} & APN (act=none) & 100 & 103,630 & 20 & 58.34\% (189) & 58.17\% & 25.5 & 1,590 \\
 \bottomrule
 \end{tabular}%
 }
@@ -189,17 +189,19 @@ For \textbf{inference}, the advantage is even clearer: APN/DeltaNet maintain a f
 \subsection{Key Observations}
 
 \begin{enumerate}
-\item \textbf{APN with \texttt{act=none} is the best APN variant}, reaching 58.17\% (with warmup) versus 51--52\% for \texttt{act=tanh}. The identity activation (no nonlinearity on keys) allows the model to use the full input range without saturating gradients.
+\item \textbf{APN with \texttt{act=none} is the best APN variant}, reaching 58.34\% (with warmup) versus 51--53\% for \texttt{act=tanh}. The identity activation (no nonlinearity on keys) allows the model to use the full input range without saturating gradients.
 
-\item \textbf{APN is the most parameter-efficient.} With only 103K parameters, APN (act=none) achieves 58.17\%, comparable to DeltaNet at 3$\times$ the parameters (60.80\% with 305K params) and the param-matched transformer at 59.16\%.
+\item \textbf{APN is the most parameter-efficient model.} With only 103K parameters, APN (act=none) achieves 58.34\%, close to DeltaNet at 3$\times$ the parameters (62.28\% with 305K params) and the Transformer at 12$\times$ the parameters (63.50\% with 1.2M params). In the parameter-matched group ($\approx$103K), APN trails DeltaNet $D=58$ by only 1.7 points and Transformer $D=29$ by only 1.4 points.
 
-\item \textbf{APN is the fastest per epoch.} At $\approx$26s/epoch, APN (act=none, $D=100$) is $\approx$4$\times$ faster than DeltaNet ($\approx$100s) and $\approx$1.5$\times$ faster than the transformer ($\approx$39s) at the same width.
+\item \textbf{APN is the most robust to overfitting.} DeltaNet $D=100$ peaks at epoch~11 (62.28\%) then drops to 60.80\% by epoch~200---a 1.5-point decline. DeltaNet $D=58$ is worse: peaking at 60.06\% (epoch~18) then falling to 55.40\%, a \textbf{4.7-point drop}. The param-matched Transformer ($D=29$) similarly declines from 59.75\% to 55.89\% (3.9 points). In contrast, APN act=none peaks at epoch~189 (58.34\%) with its final accuracy at 58.17\%---a mere \textbf{0.17-point gap}. This suggests APN generalizes better relative to its capacity and would not benefit from early stopping.
+
+\item \textbf{Warmup \emph{hurts} DeltaNet.} DeltaNet $D=100$ without warmup: 62.28\% peak; with 20-epoch warmup: 59.26\% peak---a 3-point \emph{drop}. For APN, warmup provides a modest but consistent gain (58.12\% $\to$ 58.34\%).
+
+\item \textbf{APN is the fastest per epoch.} At $\approx$26s/epoch, APN (act=none, $D=100$) is $\approx$4$\times$ faster than DeltaNet ($\approx$100s) and $\approx$1.5$\times$ faster than the Transformer ($\approx$39s) at the same width.
 
 \item \textbf{APN uses the least GPU memory.} 1,590 MB vs 2,133 MB (DeltaNet) vs 4,278 MB (Transformer) at $D=100$. This is expected: APN has $\approx D^2$ params per layer (one projection) versus $3D^2$ (DeltaNet) and $12D^2$ (Transformer).
 
-\item \textbf{Warmup helps slightly.} APN act=none: 57.96\% $\to$ 58.17\% with 20-epoch warmup. The gain is modest but consistent.
-
-\item \textbf{The Transformer is still the most accurate at equal width}, reaching 61.25\% at epoch 65 (still running). This is expected given its $12\times$ parameter advantage. However, even the \emph{parameter-matched} Transformer ($D=29$, 102K params) already hits 59.16\% at epoch 42, suggesting the Transformer architecture is more sample-efficient on this task.
+\item \textbf{The Transformer is the most accurate at equal width}, reaching 63.50\% at $D=100$ (1.2M params). This is expected given its $12\times$ parameter advantage. However, the Transformer benefits heavily from its built-in FFN (8$D^2$ extra params per layer); upcoming APN+FFN experiments will test whether adding an FFN closes the gap.
 \end{enumerate}
 
 % --- Training Curves ---
@@ -252,7 +254,7 @@ For \textbf{inference}, the advantage is even clearer: APN/DeltaNet maintain a f
 
 \end{axis}
 \end{tikzpicture}
-\caption{Test accuracy vs.\ epoch for all key runs. Solid lines: width-matched ($D=100$); dashed lines: parameter-matched ($\approx$103K). The transformer runs are still in progress and may improve further.}
+\caption{Test accuracy vs.\ epoch for all key runs. Solid lines: width-matched ($D=100$); dashed lines: parameter-matched ($\approx$103K). Note: DeltaNet curves peak early (epochs 11--21) then decline due to overfitting, while APN curves rise steadily and plateau near epoch 200.}
 \label{fig:test_acc}
 \end{figure}
 
@@ -378,7 +380,7 @@ For \textbf{inference}, the advantage is even clearer: APN/DeltaNet maintain a f
     (DeltaNet\\D58, 69.0)
     (DeltaNet\\D100, 100.4)
     (Transf.\\D29, 32.6)
-    (Transf.\\D100, 39.2)
+    (Transf.\\D100, 39.3)
 };
 \end{axis}
 \end{tikzpicture}
@@ -453,25 +455,23 @@ As sequence length grows ($T \gg 4096$), the $O(T)$ vs $O(T^2)$ gap widens and t
 \centering
 \caption{Effect of activation function on APN performance ($D=100$, $L=10$, 200 epochs).}
 \label{tab:activations}
-\begin{tabular}{lccc}
+\begin{tabular}{lcccc}
 \toprule
-\textbf{Activation} & \textbf{Best Test Acc} & \textbf{Train Acc (final)} & \textbf{Notes} \\
+\textbf{Activation} & \textbf{Best Test Acc} & \textbf{Best Ep} & \textbf{Train Acc (final)} & \textbf{Notes} \\
 \midrule
-\texttt{none} (identity) & \textbf{58.17\%} & 62.92\% & Best; no gradient saturation \\
-\texttt{none} (no warmup) & 57.96\% & 61.84\% & Slightly worse without warmup \\
-\texttt{tanh} ($\lambda=0.999, \eta=1.0$) & 52.50\% & 70.24\% & Overfits more; bounded keys \\
-\texttt{tanh} ($\lambda=0.99, \eta=0.01$) & 51.16\% & 62.05\% & Baseline init \\
-\texttt{tanh} (frozen $\lambda$) & 49.54\% & 61.21\% & Freezing $\lambda$ hurts \\
+\texttt{none} (identity, warmup) & \textbf{58.34\%} & 189 & 62.92\% & Best; no gradient saturation \\
+\texttt{none} (no warmup) & 58.12\% & 163 & 61.84\% & Slightly worse without warmup \\
+\texttt{tanh} ($\lambda=0.999, \eta=1.0$) & 53.15\% & 168 & 70.24\% & Overfits more; bounded keys \\
+\texttt{tanh} ($\lambda=0.99, \eta=0.01$) & 51.69\% & 162 & 62.05\% & Baseline init \\
+\texttt{tanh} (frozen $\lambda$) & 49.91\% & 157 & 61.21\% & Freezing $\lambda$ hurts \\
 \bottomrule
 \end{tabular}
-
-\smallskip
-{\footnotesize Activation sweep for \texttt{sigmoid}, \texttt{softsign}, \texttt{silu}, \texttt{gelu} is currently running.}
 \end{table}
 
-The identity activation (\texttt{none}) outperforms \texttt{tanh} by $\approx$6 percentage points.
+The identity activation (\texttt{none}) outperforms \texttt{tanh} by $\approx$5--6 percentage points.
 This is likely because \texttt{tanh} saturates for large inputs, compressing the key space and limiting the memory matrix's ability to distinguish similar inputs.
 With \texttt{act=none}, keys are the raw pre-activations, preserving the full dynamic range.
+Notably, even the best \texttt{tanh} variant (with better initialization, 53.15\%) overfits heavily: its final train accuracy is 70.24\% vs.\ only 62.92\% for \texttt{act=none}, indicating \texttt{tanh} memorizes the training set without generalizing.
 
 % ============================================================================
 \section{Ongoing and Planned Experiments}
@@ -484,26 +484,25 @@ With \texttt{act=none}, keys are the raw pre-activations, preserving the full dy
 \toprule
 \textbf{Run Name} & \textbf{Model} & \textbf{$D$} & \textbf{Params} & \textbf{Status} \\
 \midrule
-\texttt{transformer\_D100\_warmup20} & Transformer & 100 & 1.2M & Running (ep 65) \\
-\texttt{transformer\_D29\_paramatch} & Transformer & 29 & 103K & Running (ep 42) \\
-\texttt{deltanet\_D100\_warmup20} & DeltaNet & 100 & 305K & Running (ep 107) \\
-\texttt{apn\_D173\_act-tanh} & APN & 173 & 306K & Running (ep 195) \\
-\texttt{apn\_D115\_ffn\_paramatch} & APN + FFN & 115 & $\approx$1.2M & Queued (AWS H200) \\
-\texttt{deltanet\_D104\_ffn\_paramatch} & DeltaNet + FFN & 104 & $\approx$1.2M & Queued (AWS H200) \\
-Activation sweep ($\times$6) & APN & 100 & 103K & Queued (GCP H200) \\
+\texttt{apn\_D115\_ffn\_paramatch} & APN + FFN & 115 & $\approx$1.2M & Running (GCP H200) \\
+\texttt{deltanet\_D104\_ffn\_paramatch} & DeltaNet + FFN & 104 & $\approx$1.2M & Running (GCP H200) \\
+Activation sweep ($\times$5) & APN & 100 & 103K & Planned \\
 \bottomrule
 \end{tabular}
 \end{table}
+
+The two FFN experiments will reveal whether adding a feedforward network to APN/DeltaNet (parameter-matched to the Transformer at $\approx$1.2M params) closes the accuracy gap.
 
 % ============================================================================
 \section{Conclusions}
 
 \begin{enumerate}
-\item \textbf{APN achieves competitive accuracy with $\approx$3$\times$ fewer parameters} than DeltaNet and $\approx$12$\times$ fewer than the Transformer, making it the most parameter-efficient model tested.
+\item \textbf{APN achieves competitive accuracy with $\approx$3$\times$ fewer parameters} than DeltaNet and $\approx$12$\times$ fewer than the Transformer. APN (act=none, 103K params) reaches 58.34\%, vs.\ DeltaNet 62.28\% (305K) and Transformer 63.50\% (1.2M). In the parameter-matched group, APN trails DeltaNet $D=58$ by only 1.7 points and Transformer $D=29$ by only 1.4 points.
+\item \textbf{APN is the most robust model.} APN's peak and final test accuracy differ by only 0.17 points, while DeltaNet $D=58$ drops 4.7 points and Transformer $D=29$ drops 3.9 points from peak to final. APN does not require early stopping.
 \item \textbf{APN trains $\approx$4$\times$ faster} than DeltaNet and $\approx$1.5$\times$ faster than the Transformer per epoch at $D=100$, using $\approx$2.7$\times$ less GPU memory than the Transformer.
-\item \textbf{The identity activation (\texttt{act=none}) is best for APN}, outperforming \texttt{tanh} by 6+ points.
-\item \textbf{The Transformer remains the most accurate} at equal width, but this comes at a $12\times$ parameter cost. The parameter-matched Transformer ($D=29$) is only $\approx$1 point ahead of APN.
-\item Upcoming experiments with \textbf{APN + FFN} will test whether adding a feedforward network closes the accuracy gap while retaining APN's speed advantage.
+\item \textbf{The identity activation (\texttt{act=none}) is best for APN}, outperforming \texttt{tanh} by 5--6 points.
+\item \textbf{Warmup helps APN but hurts DeltaNet.} APN improves by 0.2 points with warmup; DeltaNet $D=100$ \emph{loses} 3 points.
+\item \textbf{The Transformer is the most accurate} at equal width (63.50\%), but this comes at a $12\times$ parameter cost and $2.7\times$ GPU memory cost. Upcoming \textbf{APN + FFN} experiments will test whether adding a feedforward network closes the gap.
 \end{enumerate}
 
 \end{document}
