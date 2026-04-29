@@ -229,11 +229,27 @@ class TransformerLayer(nn.Module):
 # Sequential Model
 # ---------------------------------------------------------------------------
 
+class FFNBlock(nn.Module):
+    """Pre-norm FFN block: LayerNorm → Linear(D, mult*D) → GELU → Linear(mult*D, D)."""
+
+    def __init__(self, d_hidden: int, mult: int = 4):
+        super().__init__()
+        self.norm = nn.LayerNorm(d_hidden)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_hidden, mult * d_hidden, bias=False),
+            nn.GELU(),
+            nn.Linear(mult * d_hidden, d_hidden, bias=False),
+        )
+
+    def forward(self, x):
+        return self.ffn(self.norm(x))
+
+
 class SeqModel(nn.Module):
     """
     Stack of recurrent layers for sequential classification.
 
-    Architecture: input_proj → tanh → n_layers (with residual) → LayerNorm → classifier
+    Architecture: input_proj → tanh → n_layers (with residual, optional FFN) → LayerNorm → classifier
     """
 
     def __init__(self, d_input: int, d_hidden: int, n_layers: int, n_classes: int,
@@ -261,14 +277,23 @@ class SeqModel(nn.Module):
                 self.layers.append(TransformerLayer(d_hidden, n_heads=kwargs.get('n_heads', 1)))
             else:
                 raise ValueError(f"Unknown layer_type: {layer_type}")
+        self.use_ffn = kwargs.get('use_ffn', False)
+        if self.use_ffn:
+            ffn_mult = kwargs.get('ffn_mult', 4)
+            self.ffns = nn.ModuleList([FFNBlock(d_hidden, mult=ffn_mult) for _ in range(n_layers)])
         self.norm = nn.LayerNorm(d_hidden)
         self.classifier = nn.Linear(d_hidden, n_classes)
 
     def forward(self, x):
         """x: [B, L, d_input] -> [B, n_classes]"""
         h = torch.tanh(self.input_proj(x))
-        for layer in self.layers:
-            h = h + layer(h)
+        if self.use_ffn:
+            for layer, ffn in zip(self.layers, self.ffns):
+                h = h + layer(h)
+                h = h + ffn(h)
+        else:
+            for layer in self.layers:
+                h = h + layer(h)
         return self.classifier(self.norm(h[:, -1, :]))
 
 
@@ -358,7 +383,11 @@ def main():
                         choices=list(_ACTIVATIONS.keys()),
                         help='Activation function for APN keys/queries (default: tanh)')
     parser.add_argument('--n-heads', type=int, default=1,
-                        help='Number of attention heads for transformer model (d_hidden must be divisible)')
+                        help='Number of attention heads for transformer/APN (d_hidden must be divisible)')
+    parser.add_argument('--use-ffn', action='store_true',
+                        help='Add a pre-norm FFN block after each APN/DeltaNet layer')
+    parser.add_argument('--ffn-mult', type=int, default=4,
+                        help='FFN expansion factor (default: 4x)')
     parser.add_argument('--scalar-lr', type=float, default=None,
                         help='Separate LR for eta/lam scalars (default: same as --lr)')
     parser.add_argument('--epochs', type=int, default=50)
@@ -420,6 +449,7 @@ def main():
             layer_type=model_name, apn_lam=args.apn_lam_list, apn_eta=args.apn_eta_list,
             freeze_lam=args.freeze_lam, freeze_eta=args.freeze_eta,
             apn_activation=args.apn_activation, n_heads=args.n_heads,
+            use_ffn=args.use_ffn, ffn_mult=args.ffn_mult,
         ).to(args.device)
 
         n_params = sum(p.numel() for p in model.parameters())
@@ -436,6 +466,7 @@ def main():
             run_name = args.wandb_name or f"{model_name}_L{args.n_layers}_D{args.d_hidden}"
             wandb_config = dict(
                 model=model_name, d_hidden=args.d_hidden, n_layers=args.n_layers,
+                n_heads=args.n_heads, use_ffn=args.use_ffn, ffn_mult=args.ffn_mult,
                 n_params=n_params, n_trainable=n_trainable,
                 epochs=args.epochs, batch_size=args.batch_size,
                 lr=args.lr, scalar_lr=args.scalar_lr or args.lr, weight_decay=args.weight_decay, seed=args.seed,
@@ -445,8 +476,6 @@ def main():
                 wandb_config.update(apn_lam=args.apn_lam_list, apn_eta=args.apn_eta_list,
                                     freeze_lam=args.freeze_lam, freeze_eta=args.freeze_eta,
                                     apn_activation=args.apn_activation)
-            if model_name == 'transformer':
-                wandb_config.update(n_heads=args.n_heads)
             wandb.init(project=args.wandb_project, name=run_name, config=wandb_config, reinit=True)
 
         # --- Save directory ---
