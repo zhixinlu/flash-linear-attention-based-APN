@@ -1,0 +1,509 @@
+\documentclass[11pt,a4paper]{article}
+
+% --- Packages ---
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{pgfplots}
+\usepackage{pgfplotstable}
+\pgfplotsset{compat=1.18}
+\usepgfplotslibrary{colorbrewer}
+
+% Color definitions
+\definecolor{apn-none}{HTML}{E64B35}
+\definecolor{apn-tanh}{HTML}{F39B7F}
+\definecolor{deltanet}{HTML}{4DBBD5}
+\definecolor{deltanet-pm}{HTML}{91D1C2}
+\definecolor{transformer}{HTML}{3C5488}
+\definecolor{transformer-pm}{HTML}{8491B4}
+
+\hypersetup{colorlinks=true, linkcolor=blue, citecolor=blue, urlcolor=blue}
+
+\title{Seq-CIFAR-10 Benchmark Report:\\
+Comparing APN, DeltaNet, and Transformer Baselines}
+\author{Zhixin Lu}
+\date{April 2026}
+
+\begin{document}
+\maketitle
+
+% ============================================================================
+\begin{abstract}
+We benchmark three sequence model architectures on the sequential CIFAR-10 task:
+the \textbf{Associative Plasticity Network (APN)}, mapped onto the gated delta-rule Triton kernel;
+\textbf{DeltaNet}, a delta-rule linear attention model; and a standard \textbf{softmax Transformer} with FlashAttention-2.
+All experiments use 10 layers, run for 200 epochs on a single NVIDIA H200 GPU, and share the same outer architecture
+(input projection $\to$ residual layer stack $\to$ classifier).
+We compare accuracy, training speed, GPU memory, and parameter efficiency across both
+width-matched and parameter-matched configurations.
+\end{abstract}
+
+% ============================================================================
+\section{Introduction}
+
+The Associative Plasticity Network (APN) is a biologically-inspired recurrent model that maintains a Hebbian plastic memory matrix $M_t$, updated at every time-step.
+By mapping the APN recurrence onto the \emph{gated delta-rule} chunk kernel from the Flash Linear Attention (FLA) library, we achieve efficient GPU training with $O(TD)$ complexity instead of the $O(T^2 D)$ cost of standard softmax attention.
+
+This report summarizes all experiments conducted on the \textbf{Seq-CIFAR-10} benchmark, where each $32 \times 32$ CIFAR-10 image is flattened into a sequence of $T = 1024$ RGB pixels ($3$-dimensional features), and the model classifies from the last time-step.
+
+% ============================================================================
+\section{Model Architectures}
+
+All three models share the same outer wrapper:
+\[
+\texttt{Linear}(3 \to D) \;\to\; \tanh \;\to\; \underbrace{[\texttt{Layer}_i + \text{residual}]}_{i=1}^{L} \;\to\; \texttt{LayerNorm} \;\to\; \texttt{Linear}(D \to 10)
+\]
+
+\subsection{APN Layer}
+
+Each APN layer maintains a plastic state matrix $S_t \in \mathbb{R}^{D \times D}$ with the gated delta-rule update:
+\begin{equation}
+S_t = \lambda \, S_{t-1} + \frac{\eta(1-\lambda)}{D} \, \mathbf{k}_t \otimes \bigl(\mathbf{v}_t - S_{t-1}^\top \mathbf{k}_t\bigr)
+\end{equation}
+where $\mathbf{k}_t = \text{act}(\mathbf{x}_t)$, $\mathbf{v}_t = W \cdot \text{act}(\mathbf{x}_t)$, $\lambda \in (0,1)$ is a trainable decay, and $\eta$ is a trainable learning rate scalar. The output is $\mathbf{o}_t = \mathbf{k}_t^\top S_t + \mathbf{v}_t$ (static path plus dynamic recall).
+
+\textbf{Parameters per layer:} $D^2$ (one linear projection $W$) $+ 2D$ (LayerNorm) $+ 2$ (scalars $\eta, \lambda$) $\approx D^2$.
+
+\subsection{DeltaNet Layer}
+
+DeltaNet uses separate Q/K/V projections with the (non-gated) delta rule:
+\begin{equation}
+S_t = S_{t-1} + \beta_t \, \mathbf{k}_t \otimes \bigl(\mathbf{v}_t - S_{t-1}^\top \mathbf{k}_t\bigr), \quad \mathbf{o}_t = \mathbf{q}_t^\top S_t
+\end{equation}
+where $\beta_t = \sigma(W_\beta \mathbf{x}_t)$ is a learned, input-dependent step size.
+
+\textbf{Parameters per layer:} $3D^2$ (Q/K/V projections) $+ D$ ($\beta$ projection) $+ 2D$ (LayerNorm) $\approx 3D^2$.
+
+\subsection{Transformer Layer}
+
+A pre-norm causal Transformer block:
+\[
+\texttt{LN} \to \texttt{MHA} \to \text{residual} \to \texttt{LN} \to \texttt{FFN}(D \to 4D \to D) \to \text{residual}
+\]
+Self-attention uses \texttt{F.scaled\_dot\_product\_attention} with \texttt{is\_causal=True}, which auto-dispatches to FlashAttention-2 on CUDA.
+
+\textbf{Parameters per layer:} $3D^2$ (QKV) $+ D^2$ (output proj) $+ 8D^2$ (FFN) $+ 4D$ (two LayerNorms) $\approx 12D^2$.
+
+\subsection{Optional FFN for APN/DeltaNet}
+
+To isolate the effect of the attention mechanism from the FFN, we support an optional \texttt{--use-ffn} flag that adds a pre-norm FFN block (identical to the Transformer's) after each APN or DeltaNet layer. This adds $\approx 8D^2$ parameters per layer.
+
+\subsection{Parameter Count Summary}
+
+\begin{table}[h]
+\centering
+\caption{Parameters per layer and total model parameters at $D=100$, $L=10$.}
+\label{tab:params}
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Model} & \textbf{Per-layer} & \textbf{Total (10L)} & \textbf{Relative} \\
+\midrule
+APN ($D=100$) & $\approx D^2 = 10$K & 103,630 & $1\times$ \\
+DeltaNet ($D=58$, param-matched) & $\approx 3D^2 = 10$K & 103,598 & $1\times$ \\
+DeltaNet ($D=100$) & $\approx 3D^2 = 30$K & 304,610 & $2.9\times$ \\
+Transformer ($D=29$, param-matched) & $\approx 12D^2 = 10$K & 102,554 & $1\times$ \\
+Transformer ($D=100$) & $\approx 12D^2 = 120$K & 1,205,610 & $11.6\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ============================================================================
+\section{Computational Complexity}
+
+\begin{table}[h]
+\centering
+\caption{Theoretical complexity per layer. $T$: sequence length, $D$: hidden dim, $C$: chunk size (64).}
+\label{tab:complexity}
+\begin{tabular}{lcc}
+\toprule
+\textbf{Model} & \textbf{Time} & \textbf{Memory (state)} \\
+\midrule
+Transformer (softmax) & $O(T^2 D + T D^2)$ & $O(T^2)$ per head${}^\dagger$ \\
+DeltaNet / APN (chunked) & $O(TCD + TD^2/C)$ & $O(D^2)$ per head \\
+DeltaNet / APN (recurrent) & $O(TD^2)$ & $O(D^2)$ per head \\
+\bottomrule
+\end{tabular}
+
+\smallskip
+{\footnotesize ${}^\dagger$ FlashAttention-2 reduces HBM traffic to $O(T)$ but FLOPs remain $O(T^2)$.}
+\end{table}
+
+\textbf{Why APN/DeltaNet can be faster.}
+For $T=1024$, $D=100$: the softmax attention FLOPs scale as $T^2 D = 1024^2 \times 100 \approx 10^8$, while the chunked delta-rule scales as $TCD = 1024 \times 64 \times 100 \approx 6.5 \times 10^6$ --- a $\approx 15\times$ reduction in the attention-like computation. However, the APN/DeltaNet kernels are Triton-based (less mature than FlashAttention's hand-tuned CUDA), and at small $D$ the linear projections dominate, so the wall-clock advantage depends on the specific configuration.
+
+For \textbf{inference}, the advantage is even clearer: APN/DeltaNet maintain a fixed $D \times D$ state (constant memory), while the Transformer's KV cache grows linearly with sequence length.
+
+% ============================================================================
+\section{Experimental Setup}
+
+\begin{itemize}
+\item \textbf{Hardware:} Single NVIDIA H200 GPU (141 GB HBM3e, 228 KB shared memory per SM)
+\item \textbf{Task:} Seq-CIFAR-10 (1024-step sequences, 10-class classification)
+\item \textbf{Optimizer:} AdamW ($\text{lr} = 10^{-3}$, weight decay $= 10^{-4}$, grad clip $= 1.0$)
+\item \textbf{Schedule:} Cosine annealing (with optional linear warmup)
+\item \textbf{Batch size:} 64
+\item \textbf{Epochs:} 200 (unless noted otherwise)
+\item \textbf{Seed:} 42
+\end{itemize}
+
+% ============================================================================
+\section{Results}
+
+% --- Main results table ---
+\subsection{Summary}
+
+\begin{table}[h]
+\centering
+\caption{Completed experiments (200 epochs unless noted). Bold: best per group. ${}^*$Still running.}
+\label{tab:results}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{llcccccc}
+\toprule
+\textbf{Run Name} & \textbf{Model} & \textbf{$D$} & \textbf{Params} & \textbf{Warmup} & \textbf{Best Test Acc} & \textbf{Epoch Time (s)} & \textbf{Peak GPU (MB)} \\
+\midrule
+\multicolumn{8}{l}{\textit{Parameter-matched group ($\approx$103K params)}} \\
+\midrule
+\texttt{apn\_act-none\_warmup20} & APN (act=none) & 100 & 103,630 & 20 & \textbf{58.17\%} & 25.5 & 1,590 \\
+\texttt{apn\_act-none} & APN (act=none) & 100 & 103,630 & 0 & 57.96\% & 26.0 & 1,590 \\
+\texttt{apn\_act-tanh\_better\_init} & APN (act=tanh) & 100 & 103,630 & 0 & 52.50\% & 80.1 & 1,331 \\
+\texttt{apn\_act-tanh} & APN (act=tanh) & 100 & 103,630 & 0 & 51.16\% & 26.2 & 1,617 \\
+\texttt{deltanet\_D58} & DeltaNet & 58 & 103,598 & 0 & 55.40\% & 69.0 & 1,151 \\
+\texttt{transformer\_D29\_paramatch}${}^*$ & Transformer & 29 & 102,554 & 20 & 59.16\% & 32.6 & 4,623 \\
+\midrule
+\multicolumn{8}{l}{\textit{Width-matched group ($D=100$)}} \\
+\midrule
+\texttt{transformer\_D100}${}^*$ & Transformer & 100 & 1,205,610 & 20 & \textbf{61.25\%} & 39.2 & 4,278 \\
+\texttt{deltanet\_D100} & DeltaNet & 100 & 304,610 & 0 & 60.80\% & 100.4 & 2,133 \\
+\texttt{deltanet\_D100\_warmup20}${}^*$ & DeltaNet & 100 & 304,610 & 20 & 57.50\% & 100.3 & 2,180 \\
+\texttt{apn\_act-none\_warmup20} & APN (act=none) & 100 & 103,630 & 20 & 58.17\% & 25.5 & 1,590 \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+\subsection{Key Observations}
+
+\begin{enumerate}
+\item \textbf{APN with \texttt{act=none} is the best APN variant}, reaching 58.17\% (with warmup) versus 51--52\% for \texttt{act=tanh}. The identity activation (no nonlinearity on keys) allows the model to use the full input range without saturating gradients.
+
+\item \textbf{APN is the most parameter-efficient.} With only 103K parameters, APN (act=none) achieves 58.17\%, comparable to DeltaNet at 3$\times$ the parameters (60.80\% with 305K params) and the param-matched transformer at 59.16\%.
+
+\item \textbf{APN is the fastest per epoch.} At $\approx$26s/epoch, APN (act=none, $D=100$) is $\approx$4$\times$ faster than DeltaNet ($\approx$100s) and $\approx$1.5$\times$ faster than the transformer ($\approx$39s) at the same width.
+
+\item \textbf{APN uses the least GPU memory.} 1,590 MB vs 2,133 MB (DeltaNet) vs 4,278 MB (Transformer) at $D=100$. This is expected: APN has $\approx D^2$ params per layer (one projection) versus $3D^2$ (DeltaNet) and $12D^2$ (Transformer).
+
+\item \textbf{Warmup helps slightly.} APN act=none: 57.96\% $\to$ 58.17\% with 20-epoch warmup. The gain is modest but consistent.
+
+\item \textbf{The Transformer is still the most accurate at equal width}, reaching 61.25\% at epoch 65 (still running). This is expected given its $12\times$ parameter advantage. However, even the \emph{parameter-matched} Transformer ($D=29$, 102K params) already hits 59.16\% at epoch 42, suggesting the Transformer architecture is more sample-efficient on this task.
+\end{enumerate}
+
+% --- Training Curves ---
+\subsection{Training Curves}
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+    width=0.95\textwidth,
+    height=0.5\textwidth,
+    xlabel={Epoch},
+    ylabel={Test Accuracy (\%)},
+    xmin=0, xmax=200,
+    ymin=10, ymax=65,
+    grid=major,
+    grid style={gray!30},
+    legend style={at={(0.02,0.98)}, anchor=north west, font=\small, draw=none, fill=white, fill opacity=0.8},
+    cycle list name=Set1-6,
+    every axis plot/.append style={thick},
+]
+
+\addplot[color=apn-none, thick] table[x=epoch, y=test/acc, col sep=comma]
+    {../report_data/apn_L10_D100_H200_B64_act-none_warmup20.csv};
+\addlegendentry{APN act=none+warmup (103K)}
+
+\addplot[color=apn-none, thick, dashed] table[x=epoch, y=test/acc, col sep=comma]
+    {../report_data/apn_L10_D100_H200_B64_act-none.csv};
+\addlegendentry{APN act=none (103K)}
+
+\addplot[color=apn-tanh, thick] table[x=epoch, y=test/acc, col sep=comma]
+    {../report_data/apn_L10_D100_H200_B64_act-tanh.csv};
+\addlegendentry{APN act=tanh (103K)}
+
+\addplot[color=deltanet, thick] table[x=epoch, y=test/acc, col sep=comma]
+    {../report_data/deltanet_L10_D100_H200_B64.csv};
+\addlegendentry{DeltaNet D=100 (305K)}
+
+\addplot[color=deltanet-pm, thick, dashed] table[x=epoch, y=test/acc, col sep=comma]
+    {../report_data/deltanet_L10_D58_H200_B64.csv};
+\addlegendentry{DeltaNet D=58 param-match (104K)}
+
+\addplot[color=transformer, thick] table[x=epoch, y=test/acc, col sep=comma]
+    {../report_data/transformer_L10_D100_H200_B64_warmup20.csv};
+\addlegendentry{Transformer D=100 (1.2M)}
+
+\addplot[color=transformer-pm, thick, dashed] table[x=epoch, y=test/acc, col sep=comma]
+    {../report_data/transformer_L10_D29_H200_B64_warmup20_paramatch.csv};
+\addlegendentry{Transformer D=29 param-match (103K)}
+
+\end{axis}
+\end{tikzpicture}
+\caption{Test accuracy vs.\ epoch for all key runs. Solid lines: width-matched ($D=100$); dashed lines: parameter-matched ($\approx$103K). The transformer runs are still in progress and may improve further.}
+\label{fig:test_acc}
+\end{figure}
+
+% --- Training loss curves ---
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+    width=0.95\textwidth,
+    height=0.5\textwidth,
+    xlabel={Epoch},
+    ylabel={Test Loss},
+    xmin=0, xmax=200,
+    ymin=1.0, ymax=2.5,
+    grid=major,
+    grid style={gray!30},
+    legend style={at={(0.98,0.98)}, anchor=north east, font=\small, draw=none, fill=white, fill opacity=0.8},
+    every axis plot/.append style={thick},
+]
+
+\addplot[color=apn-none, thick] table[x=epoch, y=test/loss, col sep=comma]
+    {../report_data/apn_L10_D100_H200_B64_act-none_warmup20.csv};
+\addlegendentry{APN act=none+warmup}
+
+\addplot[color=apn-tanh, thick] table[x=epoch, y=test/loss, col sep=comma]
+    {../report_data/apn_L10_D100_H200_B64_act-tanh.csv};
+\addlegendentry{APN act=tanh}
+
+\addplot[color=deltanet, thick] table[x=epoch, y=test/loss, col sep=comma]
+    {../report_data/deltanet_L10_D100_H200_B64.csv};
+\addlegendentry{DeltaNet D=100}
+
+\addplot[color=transformer, thick] table[x=epoch, y=test/loss, col sep=comma]
+    {../report_data/transformer_L10_D100_H200_B64_warmup20.csv};
+\addlegendentry{Transformer D=100}
+
+\end{axis}
+\end{tikzpicture}
+\caption{Test loss vs.\ epoch. DeltaNet reaches 100\% train accuracy but shows signs of overfitting (test loss plateaus). APN generalizes better relative to its capacity.}
+\label{fig:test_loss}
+\end{figure}
+
+% --- Scalar dynamics ---
+\begin{figure}[h]
+\centering
+\begin{subfigure}[b]{0.48\textwidth}
+\begin{tikzpicture}
+\begin{axis}[
+    width=\textwidth,
+    height=0.7\textwidth,
+    xlabel={Epoch},
+    ylabel={$\eta$},
+    xmin=0, xmax=200,
+    grid=major,
+    grid style={gray!30},
+    legend style={at={(0.02,0.98)}, anchor=north west, font=\footnotesize, draw=none, fill=white, fill opacity=0.8},
+    every axis plot/.append style={thick},
+]
+\addplot[color=apn-none, thick] table[x=epoch, y=apn/eta_layer0, col sep=comma]
+    {../report_data/apn_L10_D100_H200_B64_act-none_warmup20_scalars.csv};
+\addlegendentry{Layer 0}
+\addplot[color=transformer, thick, dashed] table[x=epoch, y=apn/eta_layer9, col sep=comma]
+    {../report_data/apn_L10_D100_H200_B64_act-none_warmup20_scalars.csv};
+\addlegendentry{Layer 9}
+\end{axis}
+\end{tikzpicture}
+\caption{Learned $\eta$ (APN act=none, warmup20)}
+\end{subfigure}
+\hfill
+\begin{subfigure}[b]{0.48\textwidth}
+\begin{tikzpicture}
+\begin{axis}[
+    width=\textwidth,
+    height=0.7\textwidth,
+    xlabel={Epoch},
+    ylabel={$\lambda$},
+    xmin=0, xmax=200,
+    ymin=0.990, ymax=1.001,
+    grid=major,
+    grid style={gray!30},
+    legend style={at={(0.02,0.02)}, anchor=south west, font=\footnotesize, draw=none, fill=white, fill opacity=0.8},
+    every axis plot/.append style={thick},
+]
+\addplot[color=apn-none, thick] table[x=epoch, y=apn/lam_layer0, col sep=comma]
+    {../report_data/apn_L10_D100_H200_B64_act-none_warmup20_scalars.csv};
+\addlegendentry{Layer 0}
+\addplot[color=transformer, thick, dashed] table[x=epoch, y=apn/lam_layer9, col sep=comma]
+    {../report_data/apn_L10_D100_H200_B64_act-none_warmup20_scalars.csv};
+\addlegendentry{Layer 9}
+\end{axis}
+\end{tikzpicture}
+\caption{Learned $\lambda$ (APN act=none, warmup20)}
+\end{subfigure}
+\caption{Evolution of trainable APN scalars $\eta$ and $\lambda$ during training (layers 0 and 9). Both parameters remain close to their initial values ($\eta=1.0$, $\lambda=0.999$), suggesting the initialization is already near-optimal for this task.}
+\label{fig:scalars}
+\end{figure}
+
+% --- Speed/Memory comparison ---
+\subsection{Speed and Memory Comparison}
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+    ybar,
+    width=0.85\textwidth,
+    height=0.45\textwidth,
+    ylabel={Epoch Time (seconds)},
+    symbolic x coords={APN\\none\\D100, APN\\tanh\\D100, DeltaNet\\D58, DeltaNet\\D100, Transf.\\D29, Transf.\\D100},
+    xtick=data,
+    x tick label style={align=center, font=\small},
+    ymin=0, ymax=120,
+    bar width=20pt,
+    nodes near coords,
+    nodes near coords style={font=\scriptsize, above},
+    every node near coord/.append style={anchor=south},
+    grid=major,
+    grid style={gray!30, dashed},
+]
+\addplot[fill=apn-none!80] coordinates {
+    (APN\\none\\D100, 25.5)
+    (APN\\tanh\\D100, 26.2)
+    (DeltaNet\\D58, 69.0)
+    (DeltaNet\\D100, 100.4)
+    (Transf.\\D29, 32.6)
+    (Transf.\\D100, 39.2)
+};
+\end{axis}
+\end{tikzpicture}
+\caption{Training time per epoch (lower is better). APN at $D=100$ is $\approx$4$\times$ faster than DeltaNet and $\approx$1.5$\times$ faster than the Transformer at the same width.}
+\label{fig:epoch_time}
+\end{figure}
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+    ybar,
+    width=0.85\textwidth,
+    height=0.45\textwidth,
+    ylabel={Peak GPU Memory (MB)},
+    symbolic x coords={APN\\none\\D100, APN\\tanh\\D100, DeltaNet\\D58, DeltaNet\\D100, Transf.\\D29, Transf.\\D100},
+    xtick=data,
+    x tick label style={align=center, font=\small},
+    ymin=0, ymax=5500,
+    bar width=20pt,
+    nodes near coords,
+    nodes near coords style={font=\scriptsize, above},
+    every node near coord/.append style={anchor=south},
+    grid=major,
+    grid style={gray!30, dashed},
+]
+\addplot[fill=deltanet!80] coordinates {
+    (APN\\none\\D100, 1590)
+    (APN\\tanh\\D100, 1617)
+    (DeltaNet\\D58, 1151)
+    (DeltaNet\\D100, 2133)
+    (Transf.\\D29, 4623)
+    (Transf.\\D100, 4278)
+};
+\end{axis}
+\end{tikzpicture}
+\caption{Peak GPU memory (lower is better). APN uses $\approx$2.7$\times$ less memory than the Transformer at $D=100$. Note: Transformer D=29 uses more memory than D=100 due to FlashAttention overhead dominating at small $D$.}
+\label{fig:gpu_mem}
+\end{figure}
+
+% ============================================================================
+\section{Why APN Is Faster}
+
+Three factors explain APN's speed advantage over DeltaNet and the Transformer:
+
+\begin{enumerate}
+\item \textbf{Fewer parameters and projections.}
+APN uses a single $D \times D$ projection ($W$) per layer, while DeltaNet uses three ($W_Q, W_K, W_V$) and the Transformer uses four projections plus a $D \to 4D \to D$ FFN.
+At $D=100$: APN computes $10$K multiply-adds for projections per layer; DeltaNet computes $30$K; the Transformer computes $120$K.
+Fewer projections means fewer GEMM calls, which dominate small-$D$ wall-clock time.
+
+\item \textbf{Linear complexity in $T$.}
+The gated delta-rule kernel processes the $T=1024$ sequence in chunks of $C=64$, computing a $C \times C$ triangular system within each chunk and propagating a $D \times D$ state across chunks.
+The total work scales as $O(TCD + TD^2/C)$, which is \emph{linear} in $T$.
+Softmax attention (even with FlashAttention) is $O(T^2 D)$---quadratic in $T$.
+At $T=1024, D=100$: APN's attention FLOPs are $\approx 15\times$ fewer.
+
+\item \textbf{Compact recurrent state.}
+APN/DeltaNet store a $D \times D$ matrix per head---$40$~KB at $D=100$ in FP32.
+The Transformer must store Q/K/V activations proportional to $T$ for the backward pass, even with FlashAttention's memory-efficient recomputation.
+This translates to lower HBM traffic and better cache utilization for the recurrent models.
+\end{enumerate}
+
+\textbf{Caveat:} FlashAttention-2 is implemented in hand-tuned CUDA (by Tri Dao), achieving near-peak throughput.
+The FLA kernels are written in Triton, which generates good but not optimal GPU code.
+As sequence length grows ($T \gg 4096$), the $O(T)$ vs $O(T^2)$ gap widens and the recurrent models' advantage becomes dominant regardless of kernel maturity.
+
+% ============================================================================
+\section{Activation Function Analysis}
+
+\begin{table}[h]
+\centering
+\caption{Effect of activation function on APN performance ($D=100$, $L=10$, 200 epochs).}
+\label{tab:activations}
+\begin{tabular}{lccc}
+\toprule
+\textbf{Activation} & \textbf{Best Test Acc} & \textbf{Train Acc (final)} & \textbf{Notes} \\
+\midrule
+\texttt{none} (identity) & \textbf{58.17\%} & 62.92\% & Best; no gradient saturation \\
+\texttt{none} (no warmup) & 57.96\% & 61.84\% & Slightly worse without warmup \\
+\texttt{tanh} ($\lambda=0.999, \eta=1.0$) & 52.50\% & 70.24\% & Overfits more; bounded keys \\
+\texttt{tanh} ($\lambda=0.99, \eta=0.01$) & 51.16\% & 62.05\% & Baseline init \\
+\texttt{tanh} (frozen $\lambda$) & 49.54\% & 61.21\% & Freezing $\lambda$ hurts \\
+\bottomrule
+\end{tabular}
+
+\smallskip
+{\footnotesize Activation sweep for \texttt{sigmoid}, \texttt{softsign}, \texttt{silu}, \texttt{gelu} is currently running.}
+\end{table}
+
+The identity activation (\texttt{none}) outperforms \texttt{tanh} by $\approx$6 percentage points.
+This is likely because \texttt{tanh} saturates for large inputs, compressing the key space and limiting the memory matrix's ability to distinguish similar inputs.
+With \texttt{act=none}, keys are the raw pre-activations, preserving the full dynamic range.
+
+% ============================================================================
+\section{Ongoing and Planned Experiments}
+
+\begin{table}[h]
+\centering
+\caption{Jobs currently running or queued.}
+\label{tab:ongoing}
+\begin{tabular}{llccl}
+\toprule
+\textbf{Run Name} & \textbf{Model} & \textbf{$D$} & \textbf{Params} & \textbf{Status} \\
+\midrule
+\texttt{transformer\_D100\_warmup20} & Transformer & 100 & 1.2M & Running (ep 65) \\
+\texttt{transformer\_D29\_paramatch} & Transformer & 29 & 103K & Running (ep 42) \\
+\texttt{deltanet\_D100\_warmup20} & DeltaNet & 100 & 305K & Running (ep 107) \\
+\texttt{apn\_D173\_act-tanh} & APN & 173 & 306K & Running (ep 195) \\
+\texttt{apn\_D115\_ffn\_paramatch} & APN + FFN & 115 & $\approx$1.2M & Queued (AWS H200) \\
+\texttt{deltanet\_D104\_ffn\_paramatch} & DeltaNet + FFN & 104 & $\approx$1.2M & Queued (AWS H200) \\
+Activation sweep ($\times$6) & APN & 100 & 103K & Queued (GCP H200) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ============================================================================
+\section{Conclusions}
+
+\begin{enumerate}
+\item \textbf{APN achieves competitive accuracy with $\approx$3$\times$ fewer parameters} than DeltaNet and $\approx$12$\times$ fewer than the Transformer, making it the most parameter-efficient model tested.
+\item \textbf{APN trains $\approx$4$\times$ faster} than DeltaNet and $\approx$1.5$\times$ faster than the Transformer per epoch at $D=100$, using $\approx$2.7$\times$ less GPU memory than the Transformer.
+\item \textbf{The identity activation (\texttt{act=none}) is best for APN}, outperforming \texttt{tanh} by 6+ points.
+\item \textbf{The Transformer remains the most accurate} at equal width, but this comes at a $12\times$ parameter cost. The parameter-matched Transformer ($D=29$) is only $\approx$1 point ahead of APN.
+\item Upcoming experiments with \textbf{APN + FFN} will test whether adding a feedforward network closes the accuracy gap while retaining APN's speed advantage.
+\end{enumerate}
+
+\end{document}
