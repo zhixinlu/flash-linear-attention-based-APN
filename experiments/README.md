@@ -118,17 +118,17 @@ LayerNorm → Multi-Head Self-Attention → residual → LayerNorm → FFN → r
 
 The transformer has significantly more parameters per layer due to the FFN (4x expansion):
 
-| Component | DeltaNet (per layer) | APN (per layer) | Transformer (per layer) |
-|---|---|---|---|
-| Q/K/V projections | $3D^2$ | $D^2$ (W only) | $3D^2$ (fused QKV) |
-| Output projection | — | — | $D^2$ |
-| FFN | — | — | $8D^2$ (up + down) |
-| Beta projection | $D$ | — | — |
-| LayerNorm | $2D$ | $2D$ | $4D$ (two norms) |
-| Scalars | — | 2 ($\eta$, $\lambda$) | — |
-| **Total** | **$\approx 3D^2$** | **$\approx D^2$** | **$\approx 12D^2$** |
+| Component | DeltaNet (per layer) | APN (per layer) | APN + FFN (per layer) | Transformer (per layer) |
+|---|---|---|---|---|
+| Q/K/V projections | $3D^2$ | $D^2$ (W only) | $D^2$ (W only) | $3D^2$ (fused QKV) |
+| Output projection | — | — | — | $D^2$ |
+| FFN | — | — | $8D^2$ (up + down) | $8D^2$ (up + down) |
+| Beta projection | $D$ | — | — | — |
+| LayerNorm | $2D$ | $2D$ | $4D$ (two norms) | $4D$ (two norms) |
+| Scalars | — | 2 ($\eta$, $\lambda$) | 2 ($\eta$, $\lambda$) | — |
+| **Total** | **$\approx 3D^2$** | **$\approx D^2$** | **$\approx 9D^2$** | **$\approx 12D^2$** |
 
-At $D = 100$, 10 layers: DeltaNet ≈ 300K, APN ≈ 100K, Transformer ≈ 1.2M params (in attention/FFN only).
+At $D = 100$, 10 layers: DeltaNet ≈ 300K, APN ≈ 100K, APN+FFN ≈ 900K, Transformer ≈ 1.2M params (in attention/FFN only).
 
 ### Complexity
 
@@ -181,6 +181,22 @@ python experiments/seq_cifar.py --model both --n-layers 10 --d-hidden 100 \
 python experiments/seq_cifar.py --model apn --n-layers 10 --d-hidden 100 \
     --apn-lam 0.999 --apn-eta 1.0 --epochs 200 --warmup-epochs 20 --batch-size 64
 
+# APN with FFN (adds pre-norm FFN block after each layer, like a transformer)
+python experiments/seq_cifar.py --model apn --use-ffn --n-layers 10 --d-hidden 100 \
+    --apn-lam 0.999 --apn-eta 1.0 --epochs 200 --warmup-epochs 20 --batch-size 64
+
+# APN with FFN and multi-head attention
+python experiments/seq_cifar.py --model apn --use-ffn --n-heads 4 --n-layers 10 --d-hidden 100 \
+    --apn-lam 0.999 --apn-eta 1.0 --epochs 200 --warmup-epochs 20 --batch-size 64
+
+# DeltaNet with FFN
+python experiments/seq_cifar.py --model deltanet --use-ffn --n-layers 10 --d-hidden 100 \
+    --epochs 200 --warmup-epochs 20 --batch-size 64
+
+# Custom FFN expansion factor (2x instead of default 4x)
+python experiments/seq_cifar.py --model apn --use-ffn --ffn-mult 2 --n-layers 10 --d-hidden 100 \
+    --apn-lam 0.999 --apn-eta 1.0 --epochs 200 --batch-size 64
+
 # Freeze lambda (fixed decay, only W and eta train)
 python experiments/seq_cifar.py --model apn --n-layers 10 --d-hidden 100 \
     --apn-lam 0.99 --apn-eta 1.0 --freeze-lam --epochs 50 --batch-size 64
@@ -193,7 +209,9 @@ python experiments/seq_cifar.py --model apn --n-layers 10 --d-hidden 100 \
 | `--model` | `both` | `deltanet`, `apn`, `transformer`, or `both` (DeltaNet + APN) |
 | `--d-hidden` | `100` | Hidden dimension per layer |
 | `--n-layers` | `10` | Number of layers |
-| `--n-heads` | `1` | Number of attention heads (transformer only; `d-hidden` must be divisible) |
+| `--n-heads` | `1` | Number of attention heads (transformer and APN; `d-hidden` must be divisible) |
+| `--use-ffn` | off | Add a pre-norm FFN block after each APN/DeltaNet layer |
+| `--ffn-mult` | `4` | FFN expansion factor (e.g. 4 means `D → 4D → D`) |
 | `--apn-lam` | `0.99` | Initial $\lambda$ for APN |
 | `--apn-eta` | `0.01` | Initial $\eta$ for APN (O(1) scale is fine due to normalization) |
 | `--apn-activation` | `tanh` | Activation for APN keys/queries (`none`, `tanh`, `sigmoid`, `softsign`, `silu`, `gelu`) |
