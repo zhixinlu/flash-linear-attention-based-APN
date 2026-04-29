@@ -66,34 +66,37 @@ def get_activation(name: str):
 
 class DeltaNetLayer(nn.Module):
     """
-    Single-head DeltaNet layer using the fused recurrent Triton kernel.
+    Multi-head DeltaNet layer using the fused recurrent Triton kernel.
 
     Recurrence (delta rule):
         S_t = S_{t-1} + beta * k_t (v_t - S_{t-1} k_t)^T
         o_t = q_t^T S_t
     """
 
-    def __init__(self, d_hidden: int):
+    def __init__(self, d_hidden: int, n_heads: int = 1):
         super().__init__()
+        assert d_hidden % n_heads == 0, f"d_hidden={d_hidden} not divisible by n_heads={n_heads}"
+        self.n_heads = n_heads
+        self.head_dim = d_hidden // n_heads
         self.q_proj = nn.Linear(d_hidden, d_hidden, bias=False)
         self.k_proj = nn.Linear(d_hidden, d_hidden, bias=False)
         self.v_proj = nn.Linear(d_hidden, d_hidden, bias=False)
-        self.b_proj = nn.Linear(d_hidden, 1, bias=False)
+        self.b_proj = nn.Linear(d_hidden, n_heads, bias=False)
         self.o_norm = nn.LayerNorm(d_hidden)
 
     def forward(self, x):
         """x: [B, L, D] -> [B, L, D]"""
-        q = self.q_proj(x)
-        k = F.normalize(self.k_proj(x), p=2, dim=-1)
-        v = F.silu(self.v_proj(x))
-        beta = self.b_proj(x).sigmoid()                  # [B, L, 1]
+        B, L, D = x.shape
+        H = self.n_heads
+        d = self.head_dim
+        q = self.q_proj(x).reshape(B, L, H, d)
+        k = F.normalize(self.k_proj(x).reshape(B, L, H, d), p=2, dim=-1)
+        v = F.silu(self.v_proj(x)).reshape(B, L, H, d)
+        beta = self.b_proj(x).sigmoid()                  # [B, L, H]
 
-        # fused_recurrent_delta_rule expects [B, T, H, D] with H=1
-        o, _ = fused_recurrent_delta_rule(
-            q.unsqueeze(2), k.unsqueeze(2), v.unsqueeze(2),
-            beta.squeeze(-1).unsqueeze(2),
-        )
-        return self.o_norm(o.squeeze(2))
+        # fused_recurrent_delta_rule expects [B, T, H, d]
+        o, _ = fused_recurrent_delta_rule(q, k, v, beta)
+        return self.o_norm(o.reshape(B, L, D))
 
 
 # ---------------------------------------------------------------------------
@@ -133,7 +136,7 @@ class APNLayer(nn.Module):
     Multi-head: splits D into H independent heads of dimension d = D/H.
     """
 
-    def __init__(self, d_hidden: int, n_heads: int = 1, lam: float = 0.99, eta: float = 0.01,
+    def __init__(self, d_hidden: int, n_heads: int = 1, lam=0.99, eta=0.01,
                  freeze_lam: bool = False, freeze_eta: bool = False,
                  activation: str = 'tanh'):
         super().__init__()
@@ -142,10 +145,21 @@ class APNLayer(nn.Module):
         self.n_heads = n_heads
         self.head_dim = d_hidden // n_heads
         self.act_fn = get_activation(activation)
-        self.eta = nn.Parameter(torch.tensor(float(eta)))
+        # eta/lam: per-head vectors [H] (accept float or list of H floats)
+        if isinstance(eta, (list, tuple)):
+            assert len(eta) == n_heads, f"len(eta)={len(eta)} != n_heads={n_heads}"
+            eta_t = torch.tensor([float(e) for e in eta])
+        else:
+            eta_t = torch.full((n_heads,), float(eta))
+        self.eta = nn.Parameter(eta_t)
         self.eta.requires_grad_(not freeze_eta)
         # lam in (0,1) via sigmoid: logit(0.99) ≈ 4.595
-        self.lam_logit = nn.Parameter(torch.tensor(lam).logit())
+        if isinstance(lam, (list, tuple)):
+            assert len(lam) == n_heads, f"len(lam)={len(lam)} != n_heads={n_heads}"
+            lam_t = torch.tensor([float(l) for l in lam])
+        else:
+            lam_t = torch.full((n_heads,), float(lam))
+        self.lam_logit = nn.Parameter(lam_t.logit())
         self.lam_logit.requires_grad_(not freeze_lam)
         self.W = nn.Linear(d_hidden, d_hidden, bias=False)
         self.o_norm = nn.LayerNorm(d_hidden)
@@ -159,7 +173,7 @@ class APNLayer(nn.Module):
         B, L, D = x.shape
         H = self.n_heads
         d = self.head_dim
-        lam = self.lam
+        lam = self.lam                                            # [H]
 
         x_act = self.act_fn(x)                                    # [B, L, D]
         static_out = self.W(x_act)                                # [B, L, D]
@@ -169,8 +183,8 @@ class APNLayer(nn.Module):
         v = static_out.reshape(B, L, H, d)
         q = x_act.reshape(B, L, H, d)
 
-        g = lam.log().expand(B, L, H)                            # [B, L, H]
-        beta = (self.eta * (1 - lam) / d).expand(B, L, H)        # [B, L, H] — normalize by head_dim
+        g = lam.log().view(1, 1, H).expand(B, L, H)              # [B, L, H]
+        beta = (self.eta * (1 - lam) / d).view(1, 1, H).expand(B, L, H)  # [B, L, H]
 
         o_dyn, _ = chunk_gated_delta_rule(
             q=q, k=k, v=v, g=g, beta=beta,
@@ -258,6 +272,10 @@ class SeqModel(nn.Module):
                  freeze_lam: bool = False, freeze_eta: bool = False,
                  apn_activation: str = 'tanh', **kwargs):
         super().__init__()
+        n_heads = kwargs.get('n_heads', 1)
+        # per_head_lam / per_head_eta: list of H floats (overrides apn_lam/eta for all layers)
+        per_head_lam = kwargs.get('per_head_lam', None)
+        per_head_eta = kwargs.get('per_head_eta', None)
         # apn_lam / apn_eta can be a single float or a list of per-layer floats
         if not isinstance(apn_lam, (list, tuple)):
             apn_lam = [apn_lam] * n_layers
@@ -267,14 +285,17 @@ class SeqModel(nn.Module):
         self.layers = nn.ModuleList()
         for i in range(n_layers):
             if layer_type == 'deltanet':
-                self.layers.append(DeltaNetLayer(d_hidden))
+                self.layers.append(DeltaNetLayer(d_hidden, n_heads=n_heads))
             elif layer_type == 'apn':
-                self.layers.append(APNLayer(d_hidden, n_heads=kwargs.get('n_heads', 1),
-                                            lam=apn_lam[i], eta=apn_eta[i],
+                # Use per-head values if provided, else per-layer scalar
+                layer_lam = per_head_lam if per_head_lam is not None else apn_lam[i]
+                layer_eta = per_head_eta if per_head_eta is not None else apn_eta[i]
+                self.layers.append(APNLayer(d_hidden, n_heads=n_heads,
+                                            lam=layer_lam, eta=layer_eta,
                                             freeze_lam=freeze_lam, freeze_eta=freeze_eta,
                                             activation=apn_activation))
             elif layer_type == 'transformer':
-                self.layers.append(TransformerLayer(d_hidden, n_heads=kwargs.get('n_heads', 1)))
+                self.layers.append(TransformerLayer(d_hidden, n_heads=n_heads))
             else:
                 raise ValueError(f"Unknown layer_type: {layer_type}")
         self.use_ffn = kwargs.get('use_ffn', False)
@@ -384,6 +405,10 @@ def main():
                         help='Activation function for APN keys/queries (default: tanh)')
     parser.add_argument('--n-heads', type=int, default=1,
                         help='Number of attention heads for transformer/APN (d_hidden must be divisible)')
+    parser.add_argument('--apn-per-head-lam', type=str, default=None,
+                        help='Per-head lambda init (comma-separated H values, e.g. "0.999,0.99,0.9,0.999"). Overrides --apn-lam for all layers.')
+    parser.add_argument('--apn-per-head-eta', type=str, default=None,
+                        help='Per-head eta init (comma-separated H values, e.g. "1.0,1.0,1.0,0.1"). Overrides --apn-eta for all layers.')
     parser.add_argument('--use-ffn', action='store_true',
                         help='Add a pre-norm FFN block after each APN/DeltaNet layer')
     parser.add_argument('--ffn-mult', type=int, default=4,
@@ -421,6 +446,20 @@ def main():
     args.apn_lam_list = parse_per_layer(args.apn_lam, args.n_layers, 'apn-lam')
     args.apn_eta_list = parse_per_layer(args.apn_eta, args.n_layers, 'apn-eta')
 
+    # Parse per-head lam/eta values (overrides per-layer for all layers)
+    args.per_head_lam = None
+    args.per_head_eta = None
+    if args.apn_per_head_lam is not None:
+        vals = [float(x.strip()) for x in args.apn_per_head_lam.split(',')]
+        if len(vals) != args.n_heads:
+            parser.error(f'--apn-per-head-lam has {len(vals)} values but --n-heads is {args.n_heads}')
+        args.per_head_lam = vals
+    if args.apn_per_head_eta is not None:
+        vals = [float(x.strip()) for x in args.apn_per_head_eta.split(',')]
+        if len(vals) != args.n_heads:
+            parser.error(f'--apn-per-head-eta has {len(vals)} values but --n-heads is {args.n_heads}')
+        args.per_head_eta = vals
+
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
@@ -450,6 +489,7 @@ def main():
             freeze_lam=args.freeze_lam, freeze_eta=args.freeze_eta,
             apn_activation=args.apn_activation, n_heads=args.n_heads,
             use_ffn=args.use_ffn, ffn_mult=args.ffn_mult,
+            per_head_lam=args.per_head_lam, per_head_eta=args.per_head_eta,
         ).to(args.device)
 
         n_params = sum(p.numel() for p in model.parameters())
@@ -475,7 +515,8 @@ def main():
             if model_name == 'apn':
                 wandb_config.update(apn_lam=args.apn_lam_list, apn_eta=args.apn_eta_list,
                                     freeze_lam=args.freeze_lam, freeze_eta=args.freeze_eta,
-                                    apn_activation=args.apn_activation)
+                                    apn_activation=args.apn_activation,
+                                    per_head_lam=args.per_head_lam, per_head_eta=args.per_head_eta)
             wandb.init(project=args.wandb_project, name=run_name, config=wandb_config, reinit=True)
 
         # --- Save directory ---
@@ -528,8 +569,9 @@ def main():
                 }
                 if model_name == 'apn':
                     for i, layer in enumerate(model.layers):
-                        log_dict[f'apn/eta_layer{i}'] = layer.eta.item()
-                        log_dict[f'apn/lam_layer{i}'] = layer.lam.item()
+                        for h in range(layer.n_heads):
+                            log_dict[f'apn/eta_layer{i}_head{h}'] = layer.eta[h].item()
+                            log_dict[f'apn/lam_layer{i}_head{h}'] = layer.lam[h].item()
                 wandb.log(log_dict, step=epoch)
 
             # --- Save best model ---
