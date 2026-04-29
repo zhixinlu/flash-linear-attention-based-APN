@@ -668,6 +668,47 @@ APN (no FFN) & 100 & 58.34\% (189) & 62.9\% & 0.17 & 25.5s & 1,590 \\
 This result highlights a fundamental architectural difference: DeltaNet's separate Q, K, V projections ($3D^2$) create a richer feature space that benefits from FFN post-processing, while APN's tied key-value design ($D^2$) does not.
 
 % ============================================================================
+\section{Ongoing Experiments: Multi-Head APN}
+\label{sec:multihead}
+
+To test whether splitting the hidden dimension into multiple independent heads improves representation diversity, we are currently running four multi-head experiments ($H=4$) with per-head initialization of the plasticity parameters $\lambda$ and $\eta$:
+
+\begin{table}[h]
+\centering
+\caption{Multi-head experiments in progress ($H=4$, $L=10$, 200 epochs, 20-epoch warmup).}
+\label{tab:multihead_runs}
+\begin{tabular}{llcccc}
+\toprule
+\textbf{Run Name} & \textbf{Model} & \textbf{$D$} & \textbf{$H$} & \textbf{Params} & \textbf{Notes} \\
+\midrule
+\texttt{transformer\_D100\_H4} & Transformer & 100 & 4 & 1,205,610 & Reference (same arch as $H=1$) \\
+\texttt{deltanet\_D104\_H4\_ffn} & DeltaNet + FFN & 104 & 4 & 1,199,754 & Param-matched to Transformer \\
+\texttt{apn\_D116\_H4\_ffn\_perhead} & APN + FFN & 116 & 4 & 1,217,626 & Per-head $\lambda/\eta$ \\
+\texttt{apn\_D100\_H4\_perhead} & APN (no FFN) & 100 & 4 & 103,690 & Per-head $\lambda/\eta$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Per-head initialization strategy.} Each of the 4 heads is initialized with a different combination of decay rate $\lambda$ and learning rate $\eta$, encouraging specialization:
+\begin{itemize}
+\item Head 0: $\lambda=0.999$, $\eta=1.0$ \quad (slow decay, strong learning --- long-term memory)
+\item Head 1: $\lambda=0.99$, $\eta=1.0$ \quad (medium decay, strong learning)
+\item Head 2: $\lambda=0.9$, $\eta=1.0$ \quad (fast decay, strong learning --- short-term memory)
+\item Head 3: $\lambda=0.999$, $\eta=0.1$ \quad (slow decay, weak learning --- slow integrator)
+\end{itemize}
+All parameters remain trainable; the diverse initialization seeds encourage different heads to specialize in different temporal scales.
+Both $\lambda$ and $\eta$ are now per-head vectors (dimension $[H]$) rather than scalars.
+
+\textbf{Hypotheses:}
+\begin{enumerate}
+\item Multi-head APN without FFN may outperform single-head APN (58.34\%) by capturing both short- and long-range dependencies simultaneously.
+\item Multi-head APN+FFN may overcome the FFN memorization problem if heads provide sufficiently diverse features for the FFN to combine.
+\item Multi-head DeltaNet+FFN and Transformer should be similar to their $H=1$ counterparts (or slightly better), since multi-head attention is standard for these architectures.
+\end{enumerate}
+
+Results will be added to this section once the experiments complete.
+
+% ============================================================================
 \section{Future Work}
 
 Based on these findings, several directions could improve APN's performance:
