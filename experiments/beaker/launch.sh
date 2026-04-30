@@ -32,5 +32,4 @@ gantry run \
   --install "pip install --no-deps -e . && pip install 'triton>=3.3.0,<3.4.0' 'transformers==4.46.3' einops wandb" \
   --env-secret WANDB_API_KEY=WANDB_API_KEY \
   --dataset "zhixin-lu/cifar10:/data" \
-  --show-logs \
   -- python experiments/seq_cifar.py --data-dir /data "$@"
