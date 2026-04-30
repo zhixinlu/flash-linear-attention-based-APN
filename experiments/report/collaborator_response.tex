@@ -1,0 +1,346 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{xcolor}
+
+\hypersetup{colorlinks=true, linkcolor=blue, citecolor=blue, urlcolor=blue}
+
+\title{Response to Collaborator Questions\\on the APN Report}
+\author{Zhixin Lu}
+\date{April 2026}
+
+\begin{document}
+\maketitle
+
+% ============================================================================
+\section{Question 1: Delta Rule vs.\ Oja's Rule}
+
+\textbf{Question:} ``Your correction term in Eq.\ (1) looks kind of like Oja's rule, but `opposite': in your notation, Oja's normalizing term would be proportional to $v^2$ (or perhaps $o^2$). What's the motivation behind your correction term? Would switching to an Oja-like rule not be advantageous? (See \href{https://arxiv.org/abs/2408.08408v3}{arXiv:2408.08408v3}.)''
+
+\subsection{The ``$W + M$'' Story: APN as Plastic Weight Augmentation}
+
+The core idea of APN is simple: each layer has a static weight $W$ (trained by backprop) augmented by a plastic state $S$ (updated online during the forward pass).
+The layer output is:
+\begin{equation}\label{eq:output}
+\mathbf{o}_t = \underbrace{W^\top \text{act}(\mathbf{x}_t)}_{\text{static: } \mathbf{v}_t} + \underbrace{S_t^\top \text{act}(\mathbf{x}_t)}_{\text{plastic recall}} = (W + S_t)^\top \text{act}(\mathbf{x}_t)
+\end{equation}
+The effective weight at time $t$ is $W + S_t$, where $S_t$ accumulates experience from the sequence seen so far.
+$W$ is fixed within a forward pass (updated only by the training loss); $S_t$ adapts \emph{within} the sequence via a Hebbian-family learning rule.
+
+The plastic state decays and updates as:
+\begin{equation}\label{eq:update}
+S_t = \lambda \, S_{t-1} + \beta \, \mathbf{k}_t \otimes \mathbf{h}_t, \qquad \beta = \frac{\eta(1-\lambda)}{d}
+\end{equation}
+where $\mathbf{k}_t = \text{act}(\mathbf{x}_t)$ is the key (pre-synaptic activity) and $\mathbf{h}_t$ is the post-synaptic learning signal.
+The entire design reduces to one question: \textbf{what is $\mathbf{h}_t$?}
+
+\subsection{Original APAN Intuition vs.\ Implemented APN}
+
+\subsubsection{Original APAN: Hebbian on the full output (unstable)}
+
+The original neuroscience intuition was to use the layer's own output as the learning signal:
+\begin{equation}
+\mathbf{h}_t^{\text{APAN}} = \mathbf{o}_t = \mathbf{v}_t + S_{t-1}^\top \mathbf{k}_t \qquad \text{(Hebbian: pre $\times$ post)}
+\end{equation}
+This gives a pure Hebbian rule $\Delta S = \beta \, \mathbf{k} \otimes \mathbf{o}$---the connection strengthens when pre and post are coactive.
+Substituting $\mathbf{o} = \mathbf{v} + S^\top \mathbf{k}$:
+\begin{equation}
+S_t = \lambda \, S_{t-1} + \beta \, \mathbf{k}_t \otimes (\mathbf{v}_t + S_{t-1}^\top \mathbf{k}_t)
+\end{equation}
+
+\textbf{Problem: positive feedback.}
+Project the recurrence onto a repeated key direction, letting $r_t = S_t^\top \mathbf{k}$ denote the recall for that key:
+\begin{equation}
+r_t = \underbrace{(\lambda + \beta \|\mathbf{k}\|^2)}_{\alpha} \, r_{t-1} + \beta \|\mathbf{k}\|^2 \, v_{\text{proj}}
+\end{equation}
+Stability requires $|\alpha| < 1$.
+With typical values ($\lambda=0.99$, $\eta=1$, $d=100$, $\|\mathbf{k}\|^2 \approx d = 100$ for unit-variance activations):
+\[
+\alpha = 0.99 + \frac{1.0 \times 0.01}{100} \times 100 = 0.99 + 0.01 = 1.00
+\]
+The system is \textbf{exactly at the stability boundary}.
+For keys with $\|\mathbf{k}\|^2 > d$ (common without key normalization), $\alpha > 1$ and the state diverges exponentially.
+The mechanism: $S^\top \mathbf{k}$ is large $\to$ output $\mathbf{o}$ is large $\to$ we store more into $S$ $\to$ next recall is larger $\to$ runaway.
+
+\subsubsection{Implemented APN: Hebbian on the prediction error (stable)}
+
+The implemented APN uses the \textbf{prediction error} as the learning signal:
+\begin{equation}
+\mathbf{h}_t^{\text{APN}} = \mathbf{v}_t - S_{t-1}^\top \mathbf{k}_t \qquad \text{(target $-$ recall = surprise)}
+\end{equation}
+giving:
+\begin{equation}\label{eq:apn-implemented}
+S_t = \lambda \, S_{t-1} + \beta \, \mathbf{k}_t \otimes (\mathbf{v}_t - S_{t-1}^\top \mathbf{k}_t)
+\end{equation}
+
+The same projection onto a repeated key gives:
+\begin{equation}
+r_t = \underbrace{(\lambda - \beta \|\mathbf{k}\|^2)}_{\alpha} \, r_{t-1} + \beta \|\mathbf{k}\|^2 \, v_{\text{proj}}
+\end{equation}
+Now $\alpha = 0.99 - 0.01 = 0.98 < 1$ --- \textbf{unconditionally stable}.
+The sign flip provides \emph{negative feedback}: larger recall $\to$ smaller error $\to$ smaller update $\to$ convergence.
+At the fixed point $S^\top \mathbf{k} = \mathbf{v}$, the error is zero and the memory stops updating---it has learned the association perfectly.
+
+\subsection{Is This Still Hebbian?}
+
+Yes. The update $\Delta S = \beta \, \mathbf{k} \otimes \mathbf{h}$ is Hebbian in the broad sense: a rank-one outer product of pre-synaptic activity ($\mathbf{k}$) and post-synaptic activity ($\mathbf{h}$).
+The post-synaptic signal $\mathbf{h} = \mathbf{v} - S^\top\mathbf{k}$ is simply a \emph{different neuron's output}---specifically, a \textbf{prediction error neuron} that computes ``what the static pathway says'' minus ``what the plastic memory already recalls.''
+
+This is biologically plausible and well-precedented:
+\begin{itemize}
+\item \textbf{Predictive coding:} Synapses update proportional to prediction errors, not raw activity. Cortical microcircuits are hypothesized to separate representation neurons from error neurons.
+\item \textbf{Cerebellar learning:} Parallel fiber$\to$Purkinje cell synapses update via climbing-fiber error signals, not via Purkinje output.
+\item \textbf{Decorrelation / anti-Hebbian circuits:} Lateral inhibition networks that prevent redundant storage.
+\end{itemize}
+
+The ``$W + M$'' intuition is fully preserved:
+\begin{itemize}
+\item Effective weight at time $t$: $W + S_t$ \checkmark
+\item Output: $(W + S_t)^\top \text{act}(\mathbf{x})$ \checkmark
+\item Plasticity: local, activity-dependent, rank-one updates \checkmark
+\item The only refinement: the post-synaptic learning signal is the \emph{surprise} (novelty) rather than the \emph{total output}.
+Expected inputs produce zero update; surprising inputs drive learning.
+\end{itemize}
+
+\subsection{How Does This Relate to DeltaNet?}
+
+DeltaNet (Yang et al., 2024) uses the same mathematical recurrence:
+\begin{equation}
+S_t = S_{t-1} + \beta_t \, \mathbf{k}_t \otimes (\mathbf{v}_t - S_{t-1}^\top \mathbf{k}_t)
+\end{equation}
+The APN differs from DeltaNet in three ways:
+
+\begin{table}[h]
+\centering
+\caption{APN vs.\ DeltaNet: same kernel, different model.}
+\begin{tabular}{lll}
+\toprule
+& \textbf{DeltaNet} & \textbf{APN (ours)} \\
+\midrule
+Gating & No decay ($\lambda = 1$) & Learnable decay $\lambda \in (0,1)$ \\
+ & or separate gate function & via sigmoid parameterization \\
+\midrule
+Learning rate $\beta$ & $\beta_t = \sigma(\mathbf{w}^\top \mathbf{x}_t)$ & $\beta = \eta(1-\lambda)/d$ \\
+ & input-dependent, per-token & scalar, shared across tokens \\
+\midrule
+Keys / Queries & Separate $\mathbf{q} = W_q\mathbf{x}$, $\mathbf{k} = W_k\mathbf{x}$ & Tied: $\mathbf{q} = \mathbf{k} = \text{act}(\mathbf{x})$ \\
+ & linear projections & optional nonlinear activation \\
+\midrule
+Values & $\mathbf{v} = W_v\mathbf{x}$ (separate proj.) & $\mathbf{v} = W\, \text{act}(\mathbf{x})$ (same as static) \\
+ & standard attention-style & ``$W + M$'' interpretation \\
+\midrule
+Motivation & Efficient attention with & Synaptic plasticity: $W$ is \\
+ & better memory capacity & the genome, $S$ is experience \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Key insight:} APN reinterprets the delta-rule recurrence through a neuroscience lens.
+DeltaNet was designed as an efficient attention replacement (keys $\neq$ queries, input-dependent $\beta$, no decay).
+APN constrains the architecture to be biologically interpretable: tied keys/queries (same pre-synaptic signal for storage and retrieval), scalar learning rate (uniform plasticity), and explicit decay (forgetting / memory lifetime control).
+These constraints happen to make APN simpler (fewer parameters) while achieving competitive performance.
+
+The shared kernel (\texttt{chunk\_gated\_delta\_rule}) is a fortunate alignment: the delta-rule recurrence that provides stability in the APN's ``$W + M$'' picture is exactly the recurrence that DeltaNet uses for efficient attention.
+APN adds the gated decay ($\lambda$-based exponential forgetting) which DeltaNet in its original form does not have, but which the \emph{gated} delta-rule kernel supports.
+
+\subsection{Why Not Oja's Rule?}
+
+Oja's rule ($\Delta S \propto \mathbf{k}\mathbf{o}^\top - \|\mathbf{o}\|^2 S$) performs online PCA---it extracts principal components while keeping weights bounded.
+This is a different objective:
+\begin{itemize}
+\item \textbf{Oja's rule} $\to$ dimensionality reduction / feature extraction.
+\item \textbf{Delta rule} $\to$ associative recall (content-addressable memory).
+\end{itemize}
+APN needs memory---it must store and retrieve specific key-value associations from the sequence.
+Oja's rule would find dominant directions of variation in the keys, but it cannot retrieve a specific value given a specific key.
+
+That said, the preprint (\href{https://arxiv.org/abs/2408.08408v3}{arXiv:2408.08408v3}) proposes Oja-like normalization for stabilizing hidden representations.
+This is \emph{complementary} to APN: one could apply Oja's normalization to the representations $\mathbf{x}$ \emph{before} they enter the delta-rule memory, combining feature normalization (Oja) with associative storage (delta rule).
+This is an unexplored direction worth investigating.
+
+% ============================================================================
+\section{Question 2: Why Not Use $|\eta|$?}
+
+\textbf{Question:} ``In any case, why not having $|\eta|$ in front of the correction term? That way you could still have anti-Hebbian when needed.''
+
+\subsection{This Is a Good Suggestion}
+
+Using $|\eta|$ (or equivalently, parameterizing as $\eta = |\hat{\eta}|$ for a free parameter $\hat{\eta}$) would:
+\begin{enumerate}
+\item \textbf{Prevent the multi-head divergence} we observed, where $\eta$ drifting negative caused the correction term to reverse sign, creating a positive feedback loop.
+\item \textbf{Still allow anti-Hebbian corrections when needed}, because the sign of the full update depends on the sign of $(\mathbf{v}_t - S_{t-1}^\top \mathbf{k}_t)$---when the recall $S^\top \mathbf{k}$ overshoots the target $\mathbf{v}$, the correction naturally becomes anti-Hebbian (pushing the memory in the opposite direction). So $|\eta| > 0$ doesn't prevent anti-Hebbian corrections; it prevents the \emph{learning rate itself} from flipping sign.
+\end{enumerate}
+
+\subsection{Why We Didn't Use $|\eta|$ in Current Experiments}
+
+The original motivation was to keep the parameterization as unconstrained as possible to observe what the model learns freely.
+For single-head APN ($H=1$, $D=100$), the unconstrained $\eta$ works fine---it stays near its initialization ($\eta = 1.0$) and never goes negative, because the gradients are well-behaved at that scale (see Figure~7 in the report, where $\eta$ barely moves from 1.0 over 200 epochs).
+The instability only manifests in the multi-head case ($H=4$, per-head $d=25$) where the small state dimension amplifies noise.
+
+\subsection{Comparison of Constraint Options}
+
+\begin{table}[h]
+\centering
+\caption{Parameterization options for $\eta$.}
+\begin{tabular}{lcccl}
+\toprule
+\textbf{Parameterization} & $\eta > 0$? & \textbf{Smooth?} & \textbf{Bounded?} & \textbf{Notes} \\
+\midrule
+$\eta$ (unconstrained) & No & Yes & No & Diverges for multi-head \\
+$|\eta|$ & Yes & No (at 0) & No & Simple; non-smooth at boundary \\
+$\text{softplus}(\hat{\eta}) = \log(1+e^{\hat{\eta}})$ & Yes & Yes & No & Preferred; $\approx \hat{\eta}$ for $\hat{\eta} \gg 0$ \\
+$\sigma(\hat{\eta})$ (sigmoid) & Yes & Yes & $(0,1)$ & Too restrictive; can't exceed 1 \\
+$e^{\hat{\eta}}$ & Yes & Yes & No & Risk of exponential blowup \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Our recommendation going forward is \textbf{softplus} rather than $|\eta|$:
+\begin{itemize}
+\item Smooth everywhere (no gradient discontinuity at $\eta = 0$).
+\item Approximately linear for $\eta \gg 0$: doesn't distort dynamics when $\eta$ is in a reasonable range.
+\item Naturally prevents $\eta$ from reaching exactly 0 (which would kill plasticity entirely).
+\end{itemize}
+
+That said, $|\eta|$ is a perfectly valid choice and would likely fix the multi-head instability.
+The gradient discontinuity at 0 is rarely a practical problem if $\eta$ is initialized away from 0 (e.g., at 1.0).
+
+\textbf{A related note:} For $\lambda$ (the decay), we already use a sigmoid parameterization ($\lambda = \sigma(\hat{\lambda})$) to ensure $\lambda \in (0,1)$.
+The asymmetry---constraining $\lambda$ but leaving $\eta$ unconstrained---was an oversight in our initial experiments.
+Future runs will use softplus for $\eta$.
+
+% ============================================================================
+\section{Question 3: Pre-Norm vs.\ Post-Norm in APN}
+
+\textbf{Question:} ``Is there any reason why you chose to use post-norm in your models? In Transformers pre-norm seems to be better (and you do use it, so it seems).''
+
+\subsection{Clarification: APN Uses Branch-Norm, Not Standard Post-Norm}
+
+Let me carefully describe the exact normalization used in each model as implemented in our code.
+
+\subsubsection{Transformer (standard pre-norm)}
+
+Our Transformer uses the standard pre-norm formulation:
+\begin{align}
+\mathbf{h} &\leftarrow \mathbf{h} + \text{MHA}(\text{LN}_1(\mathbf{h})) \\
+\mathbf{h} &\leftarrow \mathbf{h} + \text{FFN}(\text{LN}_2(\mathbf{h}))
+\end{align}
+This is standard practice. LayerNorm is applied to the residual stream \emph{before} each sub-layer. The \texttt{TransformerLayer.forward()} returns the full residual delta (attention + FFN), and the outer loop adds it: \texttt{h = h + layer(h)}.
+
+\subsubsection{APN layer (branch-norm)}
+
+The APN layer applies LayerNorm \emph{to its output branch before the residual addition}:
+\begin{equation}
+\texttt{APNLayer}(\mathbf{h}) = \text{LN}\bigl(\underbrace{W \cdot \text{act}(\mathbf{h})}_{\text{static: } \mathbf{v}} + \underbrace{\text{delta\_recall}(\text{act}(\mathbf{h}))}_{\text{dynamic: } S^\top\mathbf{k}}\bigr)
+\end{equation}
+The residual is then added by the outer loop:
+\begin{equation}
+\mathbf{h} \leftarrow \mathbf{h} + \text{LN}\bigl(W \cdot \text{act}(\mathbf{h}) + S^\top \text{act}(\mathbf{h})\bigr)
+\end{equation}
+
+In code:
+\begin{verbatim}
+# Inside APNLayer.forward():
+return self.o_norm(static_out + o_dyn.reshape(B, L, D))
+
+# Inside SeqModel.forward():
+h = h + layer(h)   # residual added externally
+\end{verbatim}
+
+This is \textbf{neither standard pre-norm} (\texttt{h + Layer(LN(h))}) \textbf{nor standard post-norm} (\texttt{LN(h + Layer(h))}).
+It is sometimes called ``sub-LayerNorm'' or ``branch normalization'': the layer's output is normalized before being added to the residual stream, but the layer's \emph{input} is NOT normalized.
+
+\subsubsection{APN + FFN (combined)}
+
+When FFN blocks are added, the FFN itself uses pre-norm:
+\begin{align}
+\mathbf{h} &\leftarrow \mathbf{h} + \text{LN}_{\text{branch}}\bigl(\text{APN}(\mathbf{h})\bigr) & \text{(APN with branch-norm)} \\
+\mathbf{h} &\leftarrow \mathbf{h} + \text{FFN}\bigl(\text{LN}_{\text{pre}}(\mathbf{h})\bigr) & \text{(FFN with pre-norm)}
+\end{align}
+
+In code:
+\begin{verbatim}
+# Inside SeqModel.forward() with use_ffn=True:
+for layer, ffn in zip(self.layers, self.ffns):
+    h = h + layer(h)    # APN output is branch-normed internally
+    h = h + ffn(h)      # FFN has pre-norm internally: ffn(x) = MLP(LN(x))
+\end{verbatim}
+
+\subsubsection{Final norm}
+
+After all layers, a final LayerNorm is applied to the last token before classification:
+\begin{equation}
+\text{logits} = W_{\text{cls}} \cdot \text{LN}_{\text{final}}(\mathbf{h}_{T})
+\end{equation}
+
+\subsection{Why Branch-Norm Instead of Pre-Norm for APN?}
+
+\begin{enumerate}
+\item \textbf{The key representation should not be normalized.}
+In APN, the keys $\mathbf{k}_t = \text{act}(\mathbf{x}_t)$ enter both the memory query and the memory update.
+If we applied pre-norm (LayerNorm on the input $\mathbf{h}$ before the layer), the keys would be normalized to unit variance at every layer.
+This would compress the key space and interfere with the delta-rule dynamics---the memory needs to distinguish between inputs of different magnitudes to store distinct associations.
+Our experimental results support this: \texttt{act=none} (identity, preserving full dynamic range) outperforms \texttt{tanh} (bounded keys) by 5--6 points for exactly this reason.
+Pre-norm would have a similar compressive effect.
+
+\item \textbf{Residual stream magnitude control.}
+Branch-norm ensures that regardless of what happens inside the delta-rule computation (which involves a $D \times D$ state matrix that could amplify signals), the contribution added to the residual stream has bounded magnitude (zero mean, unit variance).
+This provides training stability without interfering with the internal memory dynamics.
+
+\item \textbf{The Transformer is different.}
+Pre-norm works well for Transformers because the attention mechanism is inherently scale-sensitive (softmax is sensitive to logit magnitudes, and Q/K scaling is built in).
+LayerNorm before attention ensures that the query/key dot products are well-conditioned.
+For APN, the ``attention'' is implicit in the delta-rule recall $S^\top \mathbf{k}$, and the scaling is handled explicitly by the factor $\eta(1-\lambda)/d$---so input normalization is less critical.
+
+\item \textbf{Depth considerations.}
+Pre-norm's main advantage in Transformers is enabling stable training for very deep networks ($50{+}$ layers) by ensuring gradients in the residual stream don't explode/vanish.
+At our depth ($L=10$), this is less critical.
+However, pre-norm APN could help for:
+\begin{itemize}
+\item Multi-head APN (where instability is the main problem).
+\item Deeper stacks ($L \geq 20$).
+\end{itemize}
+\end{enumerate}
+
+\subsection{Would Switching to Pre-Norm Help?}
+
+Possibly, with caveats. A pre-norm APN would look like:
+\begin{equation}
+\mathbf{h} \leftarrow \mathbf{h} + \text{APN}(\text{LN}(\mathbf{h}))
+\end{equation}
+with the internal \texttt{o\_norm} removed. The risk is that normalizing the input keys reduces APN's effective associative capacity (fewer distinguishable keys in the normalized space).
+
+This is testable and we plan to investigate it in future work, particularly for multi-head configurations where stability is the primary concern. The hypothesis is that pre-norm + constrained $\eta$ (via softplus) together might enable stable multi-head APN.
+
+% ============================================================================
+\section{Summary of Architectural Choices}
+
+\begin{table}[h]
+\centering
+\caption{Normalization placement across all models in our experiments.}
+\begin{tabular}{lll}
+\toprule
+\textbf{Model} & \textbf{Norm Type} & \textbf{Formula} \\
+\midrule
+Transformer & Pre-norm & $\mathbf{h} + \text{MHA}(\text{LN}(\mathbf{h}))$; $\mathbf{h} + \text{FFN}(\text{LN}(\mathbf{h}))$ \\
+APN (no FFN) & Branch-norm & $\mathbf{h} + \text{LN}(\text{APN\_output}(\mathbf{h}))$ \\
+APN + FFN & Branch + Pre & $\mathbf{h} + \text{LN}(\text{APN\_output}(\mathbf{h}))$; $\mathbf{h} + \text{FFN}(\text{LN}(\mathbf{h}))$ \\
+GFR (no FFN) & Branch-norm & $\mathbf{h} + \text{LN}(\text{GFR\_output}(\mathbf{h}))$ \\
+DeltaNet & Pre-norm & $\mathbf{h} + \text{DeltaNet}(\text{LN}(\mathbf{h}))$ \\
+\midrule
+All models & Final norm & $W_{\text{cls}} \cdot \text{LN}(\mathbf{h}_T)$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Future Experiments Motivated by These Questions}
+
+\begin{enumerate}
+\item \textbf{Constrained $\eta$ via softplus}: Should fix multi-head divergence while preserving the anti-Hebbian correction capability (which comes from the sign of $\mathbf{v} - S^\top\mathbf{k}$, not from the sign of $\eta$).
+\item \textbf{Pre-norm APN}: Test whether $\mathbf{h} + \text{APN}(\text{LN}(\mathbf{h}))$ improves stability at the cost of key distinguishability.
+\item \textbf{Oja-like feature normalization}: Apply Oja's normalization to the \emph{representations} before they enter the delta-rule memory, as a complementary regularizer---this could combine the best of both approaches.
+\end{enumerate}
+
+\end{document}

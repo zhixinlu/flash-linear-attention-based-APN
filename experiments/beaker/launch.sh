@@ -22,6 +22,7 @@ echo ""
 
 gantry run \
   --yes \
+  --allow-dirty \
   --workspace "$WORKSPACE" \
   --cluster "$CLUSTER" \
   --gpus 1 \

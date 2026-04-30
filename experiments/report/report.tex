@@ -74,11 +74,31 @@ All models share the same outer wrapper:
 
 \subsection{APN Layer}
 
-Each APN layer maintains a plastic state matrix $S_t \in \mathbb{R}^{D \times D}$ with the gated delta-rule update:
+The APN implements the ``$W + M$'' principle: each layer's effective weight is $W + S_t$, where $W$ is a static weight trained by backpropagation and $S_t$ is a plastic state that adapts online within the forward pass.
+
+\paragraph{Output.}
+The layer output combines static and plastic pathways:
 \begin{equation}
-S_t = \lambda \, S_{t-1} + \frac{\eta(1-\lambda)}{D} \, \mathbf{k}_t \otimes \bigl(\mathbf{v}_t - S_{t-1}^\top \mathbf{k}_t\bigr)
+\mathbf{o}_t = \underbrace{W^\top \text{act}(\mathbf{x}_t)}_{\mathbf{v}_t\text{ (static)}} + \underbrace{S_t^\top \text{act}(\mathbf{x}_t)}_{\text{plastic recall}} = (W + S_t)^\top \text{act}(\mathbf{x}_t)
 \end{equation}
-where $\mathbf{k}_t = \text{act}(\mathbf{x}_t)$, $\mathbf{v}_t = W \cdot \text{act}(\mathbf{x}_t)$, $\lambda \in (0,1)$ is a trainable decay, and $\eta$ is a trainable learning rate scalar. The output is $\mathbf{o}_t = \mathbf{k}_t^\top S_t + \mathbf{v}_t$ (static path plus dynamic recall).
+
+\paragraph{Plasticity rule.}
+The plastic state $S_t \in \mathbb{R}^{D \times D}$ decays and updates via:
+\begin{equation}\label{eq:apn-update}
+S_t = \lambda \, S_{t-1} + \frac{\eta(1-\lambda)}{D} \, \mathbf{k}_t \otimes \underbrace{(\mathbf{v}_t - S_{t-1}^\top \mathbf{k}_t)}_{\mathbf{h}_t\text{ (prediction error)}}
+\end{equation}
+where $\mathbf{k}_t = \text{act}(\mathbf{x}_t)$, $\mathbf{v}_t = W \cdot \text{act}(\mathbf{x}_t)$, $\lambda \in (0,1)$ is a trainable decay, and $\eta$ is a trainable learning rate scalar.
+
+\paragraph{Distinction from the original APN/APAN framework.}
+The original APAN (Associative Plasticity with Attractor Networks) used a pure Hebbian update where the learning signal was the layer's full output: $\mathbf{h}_t = \mathbf{v}_t + S_{t-1}^\top \mathbf{k}_t$.
+The implemented APN instead uses the \emph{prediction error} $\mathbf{h}_t = \mathbf{v}_t - S_{t-1}^\top \mathbf{k}_t$ as the learning signal---the difference between what the static weight predicts and what the plastic memory already recalls.
+
+The reason for this change is \textbf{stability}: the original Hebbian form creates positive feedback (the recall amplifies itself through the update), making the system conditionally unstable when $\|\mathbf{k}\|^2 \geq d/\eta$.
+The prediction-error form provides negative feedback: once the plastic memory has learned an association ($S^\top \mathbf{k} \approx \mathbf{v}$), the update vanishes automatically.
+This makes the recurrence unconditionally stable for $\eta > 0$.
+
+The rule remains Hebbian in the broad sense---it is a rank-one outer product of pre-synaptic activity ($\mathbf{k}$) and a post-synaptic signal ($\mathbf{h}$)---but the post-synaptic signal is a \emph{surprise/novelty} signal rather than the raw output.
+The ``$W + M$'' interpretation is preserved: $W$ encodes innate/trained knowledge, $S$ accumulates experience within a sequence, and the effective weight $(W + S_t)$ grows richer over time.
 
 \textbf{Parameters per layer:} $D^2$ (one linear projection $W$) $+ 2D$ (LayerNorm) $+ 2$ (scalars $\eta, \lambda$) $\approx D^2$.
 
