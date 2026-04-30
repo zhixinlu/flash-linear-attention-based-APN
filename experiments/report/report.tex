@@ -7,6 +7,7 @@
 \usepackage{graphicx}
 \usepackage{hyperref}
 \usepackage{xcolor}
+\usepackage{colortbl}
 \usepackage{caption}
 \usepackage{subcaption}
 \usepackage{pgfplots}
@@ -379,66 +380,34 @@ APN & act=none, warmup20 & 100 & 1 & 103,630 & 58.34 & 189 & 58.17 & 0.17 & 25.5
 With only 105K parameters, APAN (RMSNorm) achieves \textbf{64.22\%} test accuracy---the highest among all $\sim$103K-parameter models, and competitive with the Transformer at 1.2M parameters (65.2\%).
 Per 1K parameters, APAN extracts 0.61\% accuracy, versus 0.56\% for the prediction-error APN, 0.58\% for DeltaNet, and only 0.053\% for the Transformer.
 
-\begin{figure}[p]
+\begin{table}[h]
 \centering
-\begin{tikzpicture}
-\begin{axis}[
-    xbar,
-    width=0.85\textwidth,
-    height=0.88\textheight,
-    xlabel={\large Peak Test Accuracy (\%)},
-    xmin=50, xmax=67.5,
-    ymin=0, ymax=17,
-    ytick={1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16},
-    yticklabels={
-        GFR K=1 (104K),
-        GFR K=4 (104K),
-        APAN tanh (104K),
-        APN+FFN (1.2M),
-        GFR+FFN D=34 (106K),
-        APAN+FFN RMSNorm (907K),
-        APN (103K),
-        GFR+FFN (1.2M),
-        Transformer D=29 (103K),
-        DeltaNet D=58 (104K),
-        DeltaNet+FFN H=1 (1.2M),
-        DeltaNet D=100 (305K),
-        Transformer H=1 (1.2M),
-        DeltaNet+FFN H=4 (1.2M),
-        \textbf{APAN RMSNorm (105K)},
-        Transformer H=4 (1.2M)
-    },
-    y tick label style={font=\normalsize, anchor=east},
-    bar width=16pt,
-    title={\Large\textbf{Peak Test Accuracy --- All Models}},
-    every node near coord/.append style={font=\normalsize, anchor=west, xshift=1pt},
-    nodes near coords={\pgfmathprintnumber[fixed, precision=1]{\pgfplotspointmeta}\%},
-    point meta=x,
-    xmajorgrids=true,
-    grid style={gray!40, dashed},
-    xtick={50,52,54,56,58,60,62,64,66},
-]
-\addplot[fill=gfr-k1, draw=black!50] coordinates {(53.57,1)};
-\addplot[fill=gfr-k4, draw=black!50] coordinates {(56.00,2)};
-\addplot[fill=apan-tanh, draw=black!50] coordinates {(56.42,3)};
-\addplot[fill=apn-ffn, draw=black!50] coordinates {(56.84,4)};
-\addplot[fill=gfr-ffn, draw=black!50] coordinates {(57.57,5)};
-\addplot[fill=apan-rmsnorm!50, draw=black!50] coordinates {(57.89,6)};
-\addplot[fill=apn-none, draw=black!50] coordinates {(58.34,7)};
-\addplot[fill=gfr-ffn, draw=black!50] coordinates {(58.93,8)};
-\addplot[fill=transformer-pm, draw=black!50] coordinates {(59.75,9)};
-\addplot[fill=deltanet-pm, draw=black!50] coordinates {(60.06,10)};
-\addplot[fill=deltanet-ffn, draw=black!50] coordinates {(62.80,11)};
-\addplot[fill=deltanet, draw=black!50] coordinates {(62.28,12)};
-\addplot[fill=transformer, draw=black!50] coordinates {(63.50,13)};
-\addplot[fill=deltanet-ffn, draw=black!50] coordinates {(63.56,14)};
-\addplot[fill=apan-rmsnorm, draw=black!50] coordinates {(64.22,15)};
-\addplot[fill=transformer, draw=black!50] coordinates {(65.16,16)};
-\end{axis}
-\end{tikzpicture}
-\caption{Summary of peak test accuracy across all models, sorted by performance. \textbf{APAN RMSNorm (105K params, purple)} achieves 64.2\%---outperforming models with $3$--$12\times$ more parameters and within 1 point of the full Transformer at 1.2M (65.2\%). Bar colors: purple = APAN, red = APN, teal = DeltaNet, blue = Transformer, brown/orange = GFR.}
-\label{fig:summary_bar}
-\end{figure}
+\caption{Peak test accuracy for all models, sorted by performance. \textbf{APAN RMSNorm (105K params)} achieves 64.2\%---outperforming models with $3$--$12\times$ more parameters and within 1 point of the full Transformer at 1.2M.}
+\label{tab:summary_ranked}
+\begin{tabular}{clccc}
+\toprule
+\textbf{Rank} & \textbf{Model} & \textbf{Params} & \textbf{Peak Acc (\%)} & \textbf{Family} \\
+\midrule
+1 & Transformer H=4 & 1,205,610 & 65.16 & Transformer \\
+\rowcolor{apan-rmsnorm!15}
+\textbf{2} & \textbf{APAN RMSNorm (no FFN)} & \textbf{104,630} & \textbf{64.22} & \textbf{APAN} \\
+3 & DeltaNet+FFN H=4 & 1,199,754 & 63.56 & DeltaNet \\
+4 & Transformer H=1 & 1,205,610 & 63.50 & Transformer \\
+5 & DeltaNet+FFN H=1 & 1,196,634 & 62.80 & DeltaNet \\
+6 & DeltaNet D=100 & 304,610 & 62.28 & DeltaNet \\
+7 & DeltaNet D=58 & 103,598 & 60.06 & DeltaNet \\
+8 & Transformer D=29 & 102,554 & 59.75 & Transformer \\
+9 & GFR+FFN D=115 & 1,196,720 & 58.93 & GFR \\
+10 & APN act=none & 103,630 & 58.34 & APN \\
+11 & APAN+FFN RMSNorm & 906,630 & 57.89 & APAN \\
+12 & GFR+FFN D=34 & 105,974 & 57.57 & GFR \\
+13 & APN+FFN & 1,196,720 & 56.84 & APN \\
+14 & APAN tanh (no FFN) & 103,630 & 56.42 & APAN \\
+15 & GFR K=4 & 103,690 & 56.00 & GFR \\
+16 & GFR K=1 & 103,630 & 53.57 & GFR \\
+\bottomrule
+\end{tabular}
+\end{table}
 
 \begin{figure}[h]
 \centering
