@@ -32,6 +32,7 @@ import torchvision.transforms as transforms
 
 from fla.ops.delta_rule import fused_recurrent_delta_rule
 from fla.ops.gated_delta_rule import chunk_gated_delta_rule
+from fla.ops.hgrn import chunk_hgrn
 
 
 # ---------------------------------------------------------------------------
@@ -196,6 +197,136 @@ class APNLayer(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# GFR Layer (Generalized Firing Rate)
+# ---------------------------------------------------------------------------
+
+class GFRLayer(nn.Module):
+    """
+    Generalized Firing Rate (GFR) layer using the HGRN chunk kernel.
+
+    Each neuron i maintains K memory slots with per-slot exponential decay:
+        [m_t]_{i,k} = lambda_k * [m_{t-1}]_{i,k} + z_{i,t}
+    where z_t = W @ act(x_t) is the projected input.
+
+    Output:
+        [h_t]_i = z_{i,t} + sum_k eta_k * [m_t]_{i,k}
+
+    The recurrence is mapped to the HGRN chunk kernel (element-wise gated scan),
+    which provides 5x speedup over sequential scan at T=1024.
+
+    Parameters per layer: D^2 (W) + K (lambda) + K (eta) + 2D (LayerNorm) ≈ D^2.
+
+    Args:
+        d_hidden: Hidden dimension D.
+        n_slots: Number of memory slots K per neuron (default: 4).
+        lam: Per-slot decay rates. Float (shared) or list of K floats.
+        eta: Per-slot readout weights. Float (shared) or list of K floats.
+        freeze_lam: If True, lambda is not trainable.
+        freeze_eta: If True, eta is not trainable.
+        activation: Activation on input before projection ('none', 'tanh', etc.).
+    """
+
+    def __init__(self, d_hidden: int, n_slots: int = 4,
+                 lam=None, eta=None,
+                 freeze_lam: bool = False, freeze_eta: bool = False,
+                 activation: str = 'none',
+                 per_neuron_lam: bool = False, per_neuron_eta: bool = False):
+        super().__init__()
+        self.d = d_hidden
+        self.n_slots = n_slots
+        self.per_neuron_lam = per_neuron_lam
+        self.per_neuron_eta = per_neuron_eta
+        self.act_fn = get_activation(activation)
+
+        # Default per-slot initialization (4 timescales)
+        if lam is None:
+            lam = [0.999, 0.99, 0.9, 0.999][:n_slots]
+            if len(lam) < n_slots:
+                lam = lam + [0.99] * (n_slots - len(lam))
+        if eta is None:
+            eta = [1.0, 1.0, 1.0, 0.1][:n_slots]
+            if len(eta) < n_slots:
+                eta = eta + [1.0] * (n_slots - len(eta))
+
+        # eta: readout weights
+        if per_neuron_eta:
+            # Shape [D, K] — each neuron×slot has its own eta
+            if isinstance(eta, (list, tuple)):
+                assert len(eta) == n_slots
+                eta_t = torch.tensor([float(e) for e in eta]).unsqueeze(0).expand(d_hidden, n_slots).clone()
+            else:
+                eta_t = torch.full((d_hidden, n_slots), float(eta))
+            self.eta = nn.Parameter(eta_t)  # [D, K]
+        else:
+            # Shape [K] — per-slot only
+            if isinstance(eta, (list, tuple)):
+                assert len(eta) == n_slots, f"len(eta)={len(eta)} != n_slots={n_slots}"
+                eta_t = torch.tensor([float(e) for e in eta])
+            else:
+                eta_t = torch.full((n_slots,), float(eta))
+            self.eta = nn.Parameter(eta_t)  # [K]
+        self.eta.requires_grad_(not freeze_eta)
+
+        # lam in (0,1) via sigmoid: store logit
+        if per_neuron_lam:
+            # Shape [D, K] — each neuron×slot has its own decay
+            if isinstance(lam, (list, tuple)):
+                assert len(lam) == n_slots
+                lam_t = torch.tensor([float(l) for l in lam]).unsqueeze(0).expand(d_hidden, n_slots).clone()
+            else:
+                lam_t = torch.full((d_hidden, n_slots), float(lam))
+            self.lam_logit = nn.Parameter(lam_t.logit())  # [D, K]
+        else:
+            # Shape [K] — per-slot only
+            if isinstance(lam, (list, tuple)):
+                assert len(lam) == n_slots, f"len(lam)={len(lam)} != n_slots={n_slots}"
+                lam_t = torch.tensor([float(l) for l in lam])
+            else:
+                lam_t = torch.full((n_slots,), float(lam))
+            self.lam_logit = nn.Parameter(lam_t.logit())  # [K]
+        self.lam_logit.requires_grad_(not freeze_lam)
+
+        self.W = nn.Linear(d_hidden, d_hidden, bias=False)
+        self.o_norm = nn.LayerNorm(d_hidden)
+
+    @property
+    def lam(self):
+        return self.lam_logit.sigmoid()
+
+    def forward(self, x):
+        """x: [B, T, D] -> [B, T, D]"""
+        B, T, D = x.shape
+        K = self.n_slots
+        lam = self.lam  # [K] or [D, K]
+
+        x_act = self.act_fn(x)                          # [B, T, D]
+        z = self.W(x_act)                               # [B, T, D]
+
+        # Prepare kernel inputs: broadcast z to K memory slots
+        # x_kernel shape: [B, T, D*K]
+        # After reshape from [B,T,D,K], element [b,t,i,k] → [b,t, i*K+k]
+        x_kernel = z.unsqueeze(-1).expand(B, T, D, K).reshape(B, T, D * K)
+
+        # Gates: log(lambda) for the gated scan
+        if self.per_neuron_lam:
+            # lam is [D, K] → flatten to [D*K]
+            log_lam = lam.log().reshape(D * K)  # [D*K]
+        else:
+            # lam is [K] → repeat for each neuron: g[i*K+k] = log(lam[k])
+            log_lam = lam.log().repeat(D)  # [D*K]
+        g_kernel = log_lam.view(1, 1, D * K).expand(B, T, D * K)
+
+        # Run HGRN chunk kernel (element-wise gated scan)
+        m_flat, _ = chunk_hgrn(x_kernel, g_kernel)      # [B, T, D*K]
+
+        # Reshape and apply eta, then sum over slots
+        m = m_flat.reshape(B, T, D, K)                  # [B, T, D, K]
+        h = z + (self.eta * m).sum(dim=-1)              # [B, T, D]
+
+        return self.o_norm(h)
+
+
+# ---------------------------------------------------------------------------
 # Transformer Layer (Softmax Attention baseline)
 # ---------------------------------------------------------------------------
 
@@ -276,6 +407,13 @@ class SeqModel(nn.Module):
         # per_head_lam / per_head_eta: list of H floats (overrides apn_lam/eta for all layers)
         per_head_lam = kwargs.get('per_head_lam', None)
         per_head_eta = kwargs.get('per_head_eta', None)
+        # GFR-specific kwargs
+        gfr_n_slots = kwargs.get('gfr_n_slots', 4)
+        gfr_per_slot_lam = kwargs.get('gfr_per_slot_lam', None)
+        gfr_per_slot_eta = kwargs.get('gfr_per_slot_eta', None)
+        gfr_activation = kwargs.get('gfr_activation', 'none')
+        gfr_per_neuron_lam = kwargs.get('gfr_per_neuron_lam', False)
+        gfr_per_neuron_eta = kwargs.get('gfr_per_neuron_eta', False)
         # apn_lam / apn_eta can be a single float or a list of per-layer floats
         if not isinstance(apn_lam, (list, tuple)):
             apn_lam = [apn_lam] * n_layers
@@ -294,6 +432,13 @@ class SeqModel(nn.Module):
                                             lam=layer_lam, eta=layer_eta,
                                             freeze_lam=freeze_lam, freeze_eta=freeze_eta,
                                             activation=apn_activation))
+            elif layer_type == 'gfr':
+                self.layers.append(GFRLayer(d_hidden, n_slots=gfr_n_slots,
+                                            lam=gfr_per_slot_lam, eta=gfr_per_slot_eta,
+                                            freeze_lam=freeze_lam, freeze_eta=freeze_eta,
+                                            activation=gfr_activation,
+                                            per_neuron_lam=gfr_per_neuron_lam,
+                                            per_neuron_eta=gfr_per_neuron_eta))
             elif layer_type == 'transformer':
                 self.layers.append(TransformerLayer(d_hidden, n_heads=n_heads))
             else:
@@ -391,7 +536,7 @@ def evaluate(model, loader, device):
 def main():
     parser = argparse.ArgumentParser(description="Seq-CIFAR-10: DeltaNet vs APN vs Transformer")
     parser.add_argument('--model', type=str, default='both',
-                        choices=['deltanet', 'apn', 'transformer', 'both'])
+                        choices=['deltanet', 'apn', 'gfr', 'transformer', 'both'])
     parser.add_argument('--d-hidden', type=int, default=100)
     parser.add_argument('--n-layers', type=int, default=10)
     parser.add_argument('--apn-lam', type=str, default='0.99',
@@ -409,6 +554,19 @@ def main():
                         help='Per-head lambda init (comma-separated H values, e.g. "0.999,0.99,0.9,0.999"). Overrides --apn-lam for all layers.')
     parser.add_argument('--apn-per-head-eta', type=str, default=None,
                         help='Per-head eta init (comma-separated H values, e.g. "1.0,1.0,1.0,0.1"). Overrides --apn-eta for all layers.')
+    parser.add_argument('--gfr-n-slots', type=int, default=4,
+                        help='Number of memory slots K per neuron for GFR (default: 4)')
+    parser.add_argument('--gfr-per-slot-lam', type=str, default=None,
+                        help='Per-slot lambda for GFR (comma-separated K values, e.g. "0.999,0.99,0.9,0.999")')
+    parser.add_argument('--gfr-per-slot-eta', type=str, default=None,
+                        help='Per-slot eta for GFR (comma-separated K values, e.g. "1.0,1.0,1.0,0.1")')
+    parser.add_argument('--gfr-per-neuron-lam', action='store_true',
+                        help='Use per-neuron-per-slot lambda (shape [D,K]) instead of per-slot [K]')
+    parser.add_argument('--gfr-per-neuron-eta', action='store_true',
+                        help='Use per-neuron-per-slot eta (shape [D,K]) instead of per-slot [K]')
+    parser.add_argument('--gfr-activation', type=str, default='none',
+                        choices=list(_ACTIVATIONS.keys()),
+                        help='Activation function for GFR input (default: none)')
     parser.add_argument('--use-ffn', action='store_true',
                         help='Add a pre-norm FFN block after each APN/DeltaNet layer')
     parser.add_argument('--ffn-mult', type=int, default=4,
@@ -460,6 +618,20 @@ def main():
             parser.error(f'--apn-per-head-eta has {len(vals)} values but --n-heads is {args.n_heads}')
         args.per_head_eta = vals
 
+    # Parse GFR per-slot lam/eta values
+    args.gfr_per_slot_lam_list = None
+    args.gfr_per_slot_eta_list = None
+    if args.gfr_per_slot_lam is not None:
+        vals = [float(x.strip()) for x in args.gfr_per_slot_lam.split(',')]
+        if len(vals) != args.gfr_n_slots:
+            parser.error(f'--gfr-per-slot-lam has {len(vals)} values but --gfr-n-slots is {args.gfr_n_slots}')
+        args.gfr_per_slot_lam_list = vals
+    if args.gfr_per_slot_eta is not None:
+        vals = [float(x.strip()) for x in args.gfr_per_slot_eta.split(',')]
+        if len(vals) != args.gfr_n_slots:
+            parser.error(f'--gfr-per-slot-eta has {len(vals)} values but --gfr-n-slots is {args.gfr_n_slots}')
+        args.gfr_per_slot_eta_list = vals
+
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
@@ -476,6 +648,8 @@ def main():
         models_to_run.append('deltanet')
     if args.model in ('apn', 'both'):
         models_to_run.append('apn')
+    if args.model == 'gfr':
+        models_to_run.append('gfr')
     if args.model == 'transformer':
         models_to_run.append('transformer')
 
@@ -490,6 +664,12 @@ def main():
             apn_activation=args.apn_activation, n_heads=args.n_heads,
             use_ffn=args.use_ffn, ffn_mult=args.ffn_mult,
             per_head_lam=args.per_head_lam, per_head_eta=args.per_head_eta,
+            gfr_n_slots=args.gfr_n_slots,
+            gfr_per_slot_lam=args.gfr_per_slot_lam_list,
+            gfr_per_slot_eta=args.gfr_per_slot_eta_list,
+            gfr_activation=args.gfr_activation,
+            gfr_per_neuron_lam=args.gfr_per_neuron_lam,
+            gfr_per_neuron_eta=args.gfr_per_neuron_eta,
         ).to(args.device)
 
         n_params = sum(p.numel() for p in model.parameters())
@@ -517,6 +697,14 @@ def main():
                                     freeze_lam=args.freeze_lam, freeze_eta=args.freeze_eta,
                                     apn_activation=args.apn_activation,
                                     per_head_lam=args.per_head_lam, per_head_eta=args.per_head_eta)
+            if model_name == 'gfr':
+                wandb_config.update(gfr_n_slots=args.gfr_n_slots,
+                                    gfr_per_slot_lam=args.gfr_per_slot_lam_list,
+                                    gfr_per_slot_eta=args.gfr_per_slot_eta_list,
+                                    gfr_activation=args.gfr_activation,
+                                    gfr_per_neuron_lam=args.gfr_per_neuron_lam,
+                                    gfr_per_neuron_eta=args.gfr_per_neuron_eta,
+                                    freeze_lam=args.freeze_lam, freeze_eta=args.freeze_eta)
             wandb.init(project=args.wandb_project, name=run_name, config=wandb_config, reinit=True)
 
         # --- Save directory ---
@@ -572,6 +760,11 @@ def main():
                         for h in range(layer.n_heads):
                             log_dict[f'apn/eta_layer{i}_head{h}'] = layer.eta[h].item()
                             log_dict[f'apn/lam_layer{i}_head{h}'] = layer.lam[h].item()
+                if model_name == 'gfr':
+                    for i, layer in enumerate(model.layers):
+                        for k in range(layer.n_slots):
+                            log_dict[f'gfr/eta_layer{i}_slot{k}'] = layer.eta[k].item()
+                            log_dict[f'gfr/lam_layer{i}_slot{k}'] = layer.lam[k].item()
                 wandb.log(log_dict, step=epoch)
 
             # --- Save best model ---
