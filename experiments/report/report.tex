@@ -23,11 +23,14 @@
 \definecolor{deltanet-ffn}{HTML}{00868B}
 \definecolor{transformer}{HTML}{3C5488}
 \definecolor{transformer-pm}{HTML}{8491B4}
+\definecolor{gfr-k1}{HTML}{7E6148}
+\definecolor{gfr-k4}{HTML}{B09C85}
+\definecolor{gfr-ffn}{HTML}{DC9C6B}
 
 \hypersetup{colorlinks=true, linkcolor=blue, citecolor=blue, urlcolor=blue}
 
 \title{Seq-CIFAR-10 Benchmark Report:\\
-Comparing APN, DeltaNet, and Transformer Baselines}
+Comparing APN, GFR, DeltaNet, and Transformer Architectures}
 \author{Zhixin Lu}
 \date{April 2026}
 
@@ -36,20 +39,20 @@ Comparing APN, DeltaNet, and Transformer Baselines}
 
 % ============================================================================
 \begin{abstract}
-We benchmark three sequence model architectures on the sequential CIFAR-10 task:
-the \textbf{Associative Plasticity Network (APN)}, mapped onto the gated delta-rule Triton kernel;
+We benchmark four sequence model architectures on the sequential CIFAR-10 task:
+the \textbf{Associative Plasticity Network (APN)}, a Hebbian memory model mapped onto the gated delta-rule Triton kernel;
+the \textbf{Gated Forgetting Recurrence (GFR)}, a simplified element-wise gated scan model;
 \textbf{DeltaNet}, a delta-rule linear attention model; and a standard \textbf{softmax Transformer} with FlashAttention-2.
-All experiments use 10 layers, run for 200 epochs on a single NVIDIA H200 GPU, and share the same outer architecture
-(input projection $\to$ residual layer stack $\to$ classifier).
-We compare accuracy, training speed, GPU memory, and parameter efficiency across
-width-matched, parameter-matched, and FFN-augmented configurations.
-Key findings: (1) plain APN (103K params) achieves 58.3\% test accuracy---within 5 points of the
-Transformer (63.5\%, 1.2M params)---while training 4$\times$ faster and using 2.7$\times$ less GPU memory;
-(2) APN is uniquely resistant to overfitting, with near-zero peak-to-final accuracy drop;
-(3) adding an FFN to APN \emph{hurts} performance (56.8\%) despite 12$\times$ more parameters,
-while DeltaNet+FFN (62.8\%) nearly matches the Transformer.
-These results suggest APN's constrained $D^2$-parameter design acts as an implicit regularizer
-that does not benefit from naive capacity scaling.
+All experiments use 10 layers, run for 200 epochs on a single NVIDIA H200 GPU, and share the same outer architecture.
+We compare single-head and multi-head ($H{=}4$) configurations, FFN-augmented variants, and parameter-matched groups.
+
+Key findings:
+(1)~Plain APN (103K params) achieves 58.3\% test accuracy---within 5 points of the Transformer (63.5\%, 1.2M params)---while training 4$\times$ faster and using 2.7$\times$ less GPU memory.
+(2)~APN is uniquely resistant to overfitting, with near-zero peak-to-final accuracy drop.
+(3)~Multi-head APN ($H{=}4$) completely diverges to NaN due to unconstrained $\eta$ going negative, whereas multi-head Transformer and DeltaNet both improve (+1.7 and +0.8 points respectively).
+(4)~GFR with $K{=}4$ memory slots (56.0\%) partially closes the gap with APN (58.3\%), confirming that the $D{\times}D$ matrix state provides meaningful associative capacity beyond simple exponential decay.
+(5)~GFR+FFN (58.9\%) outperforms APN+FFN (56.8\%), suggesting that simpler recurrences are better suited to FFN augmentation.
+(6)~Models that reach 100\% training accuracy exhibit a characteristic \emph{loss--accuracy divergence}: test loss climbs to $\sim$5.0 while test accuracy remains stable or improves, caused by increasingly confident wrong predictions on a minority of test samples.
 \end{abstract}
 
 % ============================================================================
@@ -58,13 +61,13 @@ that does not benefit from naive capacity scaling.
 The Associative Plasticity Network (APN) is a biologically-inspired recurrent model that maintains a Hebbian plastic memory matrix $M_t$, updated at every time-step.
 By mapping the APN recurrence onto the \emph{gated delta-rule} chunk kernel from the Flash Linear Attention (FLA) library, we achieve efficient GPU training with $O(TD)$ complexity instead of the $O(T^2 D)$ cost of standard softmax attention.
 
-This report summarizes all experiments conducted on the \textbf{Seq-CIFAR-10} benchmark, where each $32 \times 32$ CIFAR-10 image is flattened into a sequence of $T = 1024$ RGB pixels ($3$-dimensional features), and the model classifies from the last time-step.
-We also provide a detailed explanation of the GPU kernel infrastructure and chunk algorithm (Section~\ref{sec:kernels}) that makes efficient training possible.
+This report summarizes all 26 experiments conducted on the \textbf{Seq-CIFAR-10} benchmark, where each $32 \times 32$ CIFAR-10 image is flattened into a sequence of $T = 1024$ RGB pixels ($3$-dimensional features), and the model classifies from the last time-step.
+We compare APN, GFR (a simplified scalar-memory variant), DeltaNet, and the Transformer in single-head and multi-head configurations, with and without FFN blocks, across parameter-matched groups.
 
 % ============================================================================
 \section{Model Architectures}
 
-All three models share the same outer wrapper:
+All models share the same outer wrapper:
 \[
 \texttt{Linear}(3 \to D) \;\to\; \tanh \;\to\; \underbrace{[\texttt{Layer}_i + \text{residual}]}_{i=1}^{L} \;\to\; \texttt{LayerNorm} \;\to\; \texttt{Linear}(D \to 10)
 \]
@@ -79,6 +82,17 @@ where $\mathbf{k}_t = \text{act}(\mathbf{x}_t)$, $\mathbf{v}_t = W \cdot \text{a
 
 \textbf{Parameters per layer:} $D^2$ (one linear projection $W$) $+ 2D$ (LayerNorm) $+ 2$ (scalars $\eta, \lambda$) $\approx D^2$.
 
+\subsection{GFR Layer (Gated Forgetting Recurrence)}
+
+Each GFR layer maintains $K$ scalar memory slots per neuron (total state: $D \cdot K$ scalars):
+\begin{equation}
+m_{i,k,t} = \lambda_k \, m_{i,k,t-1} + z_{i,t}, \quad
+h_{i,t} = z_{i,t} + \sum_{k=1}^{K} \eta_k \, m_{i,k,t}
+\end{equation}
+where $\mathbf{z}_t = W \cdot \text{act}(\mathbf{x}_t)$ is the projected input. This uses the HGRN chunk kernel (simple element-wise gated prefix scan).
+
+\textbf{Parameters per layer:} $D^2$ (projection $W$) $+ 2K$ (scalars $\lambda, \eta$) $+ 2D$ (LayerNorm) $\approx D^2$.
+
 \subsection{DeltaNet Layer}
 
 DeltaNet uses separate Q/K/V projections with the (non-gated) delta rule:
@@ -91,17 +105,12 @@ where $\beta_t = \sigma(W_\beta \mathbf{x}_t)$ is a learned, input-dependent ste
 
 \subsection{Transformer Layer}
 
-A pre-norm causal Transformer block:
+A pre-norm causal Transformer block with FlashAttention-2:
 \[
 \texttt{LN} \to \texttt{MHA} \to \text{residual} \to \texttt{LN} \to \texttt{FFN}(D \to 4D \to D) \to \text{residual}
 \]
-Self-attention uses \texttt{F.scaled\_dot\_product\_attention} with \texttt{is\_causal=True}, which auto-dispatches to FlashAttention-2 on CUDA.
 
-\textbf{Parameters per layer:} $3D^2$ (QKV) $+ D^2$ (output proj) $+ 8D^2$ (FFN) $+ 4D$ (two LayerNorms) $\approx 12D^2$.
-
-\subsection{Optional FFN for APN/DeltaNet}
-
-To isolate the effect of the attention mechanism from the FFN, we support an optional \texttt{--use-ffn} flag that adds a pre-norm FFN block (identical to the Transformer's) after each APN or DeltaNet layer. This adds $\approx 8D^2$ parameters per layer.
+\textbf{Parameters per layer:} $4D^2$ (QKV + output proj) $+ 8D^2$ (FFN) $+ 4D$ (two LayerNorms) $\approx 12D^2$.
 
 \subsection{Parameter Count Summary}
 
@@ -113,48 +122,27 @@ To isolate the effect of the attention mechanism from the FFN, we support an opt
 \toprule
 \textbf{Model} & \textbf{Per-layer} & \textbf{Total (10L)} & \textbf{Relative} \\
 \midrule
-\multicolumn{4}{l}{\textit{No FFN}} \\
+\multicolumn{4}{l}{\textit{No FFN ($\approx$103K parameter-matched)}} \\
 \midrule
 APN ($D=100$) & $\approx D^2 = 10$K & 103,630 & $1\times$ \\
-DeltaNet ($D=58$, param-matched) & $\approx 3D^2 = 10$K & 103,598 & $1\times$ \\
+GFR $K{=}1$ ($D=100$) & $\approx D^2 = 10$K & 103,630 & $1\times$ \\
+GFR $K{=}4$ per-slot ($D=100$) & $\approx D^2 = 10$K & 103,690 & $1\times$ \\
+DeltaNet ($D=58$) & $\approx 3D^2 = 10$K & 103,598 & $1\times$ \\
+Transformer ($D=29$) & $\approx 12D^2 = 10$K & 102,554 & $1\times$ \\
+\midrule
+\multicolumn{4}{l}{\textit{With FFN ($\approx$1.2M parameter-matched)}} \\
+\midrule
+APN + FFN ($D=115$) & $\approx 9D^2$ & 1,196,720 & $11.5\times$ \\
+GFR $K{=}1$ + FFN ($D=115$) & $\approx 9D^2$ & 1,196,720 & $11.5\times$ \\
+DeltaNet + FFN ($D=104$) & $\approx 11D^2$ & 1,196,634 & $11.5\times$ \\
+Transformer ($D=100$) & $\approx 12D^2$ & 1,205,610 & $11.6\times$ \\
+\midrule
+\multicolumn{4}{l}{\textit{Width-matched ($D=100$, no FFN)}} \\
+\midrule
 DeltaNet ($D=100$) & $\approx 3D^2 = 30$K & 304,610 & $2.9\times$ \\
-Transformer ($D=29$, param-matched) & $\approx 12D^2 = 10$K & 102,554 & $1\times$ \\
-Transformer ($D=100$) & $\approx 12D^2 = 120$K & 1,205,610 & $11.6\times$ \\
-\midrule
-\multicolumn{4}{l}{\textit{With FFN (parameter-matched to Transformer $D=100$)}} \\
-\midrule
-APN + FFN ($D=115$) & $\approx 9D^2 = 119$K & 1,196,720 & $11.5\times$ \\
-DeltaNet + FFN ($D=104$) & $\approx 11D^2 = 119$K & 1,196,634 & $11.5\times$ \\
 \bottomrule
 \end{tabular}
 \end{table}
-
-% ============================================================================
-\section{Computational Complexity}
-
-\begin{table}[h]
-\centering
-\caption{Theoretical complexity per layer. $T$: sequence length, $D$: hidden dim, $C$: chunk size (64).}
-\label{tab:complexity}
-\begin{tabular}{lcc}
-\toprule
-\textbf{Model} & \textbf{Time} & \textbf{Memory (state)} \\
-\midrule
-Transformer (softmax) & $O(T^2 D + T D^2)$ & $O(T^2)$ per head${}^\dagger$ \\
-DeltaNet / APN (chunked) & $O(TCD + TD^2/C)$ & $O(D^2)$ per head \\
-DeltaNet / APN (recurrent) & $O(TD^2)$ & $O(D^2)$ per head \\
-\bottomrule
-\end{tabular}
-
-\smallskip
-{\footnotesize ${}^\dagger$ FlashAttention-2 reduces HBM traffic to $O(T)$ but FLOPs remain $O(T^2)$.}
-\end{table}
-
-\textbf{Why APN/DeltaNet can be faster.}
-For $T=1024$, $D=100$: the softmax attention FLOPs scale as $T^2 D = 1024^2 \times 100 \approx 10^8$, while the chunked delta-rule scales as $TCD = 1024 \times 64 \times 100 \approx 6.5 \times 10^6$ --- a $\approx 15\times$ reduction in the attention-like computation. However, the APN/DeltaNet kernels are Triton-based (less mature than FlashAttention's hand-tuned CUDA), and at small $D$ the linear projections dominate, so the wall-clock advantage depends on the specific configuration.
-
-For \textbf{inference}, the advantage is even clearer: APN/DeltaNet maintain a fixed $D \times D$ state (constant memory), while the Transformer's KV cache grows linearly with sequence length.
-Section~\ref{sec:kernels} explains in detail how the FLA Triton kernels and chunk algorithm achieve these theoretical advantages in practice.
 
 % ============================================================================
 \section{Experimental Setup}
@@ -163,181 +151,442 @@ Section~\ref{sec:kernels} explains in detail how the FLA Triton kernels and chun
 \item \textbf{Hardware:} Single NVIDIA H200 GPU (141 GB HBM3e, 228 KB shared memory per SM)
 \item \textbf{Task:} Seq-CIFAR-10 (1024-step sequences, 10-class classification)
 \item \textbf{Optimizer:} AdamW ($\text{lr} = 10^{-3}$, weight decay $= 10^{-4}$, grad clip $= 1.0$)
-\item \textbf{Schedule:} Cosine annealing (with optional linear warmup)
+\item \textbf{Schedule:} Cosine annealing with 20-epoch linear warmup (unless noted)
 \item \textbf{Batch size:} 64
-\item \textbf{Epochs:} 200 (unless noted otherwise)
+\item \textbf{Epochs:} 200
 \item \textbf{Seed:} 42
+\item \textbf{Triton version:} $\ge$3.3.0, $<$3.4.0 (pinned due to Hopper backward kernel bug in $\ge$3.4)
 \end{itemize}
 
 % ============================================================================
 \section{Results}
 
-% --- Main results table ---
-\subsection{Summary}
+\subsection{Complete Results Summary}
 
 \begin{table}[h]
 \centering
-\caption{All completed experiments (200 epochs, peak test accuracy with best epoch). Bold: best per group.}
+\caption{All 26 experiments (200 epochs unless noted). Bold: best per group. ``Drop'' = peak $-$ final test accuracy.}
 \label{tab:results}
 \resizebox{\textwidth}{!}{%
-\begin{tabular}{llccccccc}
+\begin{tabular}{llcccccccc}
 \toprule
-\textbf{Run Name} & \textbf{Model} & \textbf{$D$} & \textbf{Params} & \textbf{Warmup} & \textbf{Best Test Acc (Ep)} & \textbf{Final Test Acc} & \textbf{Epoch Time (s)} & \textbf{Peak GPU (MB)} \\
+\textbf{Model} & \textbf{Config} & \textbf{$D$} & \textbf{$H$} & \textbf{Params} & \textbf{Peak Acc (\%)} & \textbf{Peak Ep} & \textbf{Final Acc (\%)} & \textbf{Drop} & \textbf{s/ep} \\
 \midrule
-\multicolumn{9}{l}{\textit{Parameter-matched group ($\approx$103K params, no FFN)}} \\
+\multicolumn{10}{l}{\textit{Group 1: $\approx$1.2M params (with FFN or large Transformer)}} \\
 \midrule
-\texttt{deltanet\_D58} & DeltaNet & 58 & 103,598 & 0 & \textbf{60.06\%} (18) & 55.40\% & 69.0 & 1,151 \\
-\texttt{transformer\_D29\_paramatch} & Transformer & 29 & 102,554 & 20 & 59.75\% (38) & 55.89\% & 32.6 & 4,623 \\
-\texttt{apn\_act-none\_warmup20} & APN (act=none) & 100 & 103,630 & 20 & 58.34\% (189) & 58.17\% & 25.5 & 1,590 \\
-\texttt{apn\_act-none} & APN (act=none) & 100 & 103,630 & 0 & 58.12\% (163) & 57.96\% & 26.0 & 1,590 \\
-\texttt{apn\_act-tanh\_better\_init} & APN (act=tanh) & 100 & 103,630 & 0 & 53.15\% (168) & 52.50\% & 80.1 & 1,331 \\
-\texttt{apn\_act-tanh} & APN (act=tanh) & 100 & 103,630 & 0 & 51.69\% (162) & 51.16\% & 26.2 & 1,617 \\
+Transformer & $H{=}4$, warmup20 & 100 & 4 & 1,205,610 & \textbf{65.16} & 183 & 65.13 & 0.03 & 85.1 \\
+Transformer & $H{=}1$, warmup20 & 100 & 1 & 1,205,610 & 63.50 & 180 & 63.46 & 0.04 & 39.3 \\
+DeltaNet+FFN & $H{=}4$, warmup20 & 104 & 4 & 1,199,754 & 63.56 & 145 & 63.39 & 0.17 & 59.1 \\
+DeltaNet+FFN & $H{=}1$, warmup20 & 104 & 1 & 1,196,634 & 62.80 & 198 & 62.80 & 0.00 & 112.1 \\
+GFR $K{=}1$+FFN & warmup20 & 115 & 1 & 1,196,720 & 58.93 & 192 & 58.75 & 0.18 & 33.3 \\
+APN+FFN & $H{=}1$, warmup20 & 115 & 1 & 1,196,720 & 56.84 & 177 & 56.68 & 0.16 & 55.3 \\
+APN+FFN & $H{=}4$, per-head & 116 & 4 & 1,217,626 & 40.58$^\dagger$ & 9 & 10.00 & --- & 37.7 \\
 \midrule
-\multicolumn{9}{l}{\textit{Parameter-matched group ($\approx$1.2M params, with FFN)}} \\
+\multicolumn{10}{l}{\textit{Group 2: $\approx$103K params (no FFN, parameter-matched)}} \\
 \midrule
-\texttt{transformer\_D100} & Transformer & 100 & 1,205,610 & 20 & \textbf{63.50\%} (180) & 63.46\% & 39.3 & 4,278 \\
-\texttt{deltanet\_D104\_ffn} & DeltaNet + FFN & 104 & 1,196,634 & 20 & 62.80\% (198) & 62.80\% & 112.1 & 4,647 \\
-\texttt{apn\_D115\_ffn} & APN + FFN & 115 & 1,196,720 & 20 & 56.84\% (177) & 56.68\% & 55.3 & 4,358 \\
+DeltaNet & param-match & 58 & 1 & 103,598 & 60.06 & 18 & 55.40 & 4.66 & 69.0 \\
+Transformer & param-match, warmup20 & 29 & 1 & 102,554 & 59.75 & 38 & 55.89 & 3.86 & 32.6 \\
+APN & \textbf{act=none, warmup20} & 100 & 1 & 103,630 & \textbf{58.34} & 189 & 58.17 & 0.17 & 25.5 \\
+APN & act=none, no warmup & 100 & 1 & 103,630 & 58.12 & 163 & 57.96 & 0.16 & 26.0 \\
+GFR $K{=}1$+FFN & $D{=}34$, warmup20 & 34 & 1 & 105,974 & 57.57 & 39 & 51.89 & 5.68 & 18.9 \\
+GFR $K{=}4$ & per-slot, warmup20 & 100 & 1 & 103,690 & 56.00 & 199 & 55.70 & 0.30 & 22.7 \\
+GFR $K{=}4$ & per-neuron, warmup20 & 100 & 1 & 111,610 & 56.21 & 196 & 55.56 & 0.65 & 22.8 \\
+GFR $K{=}1$ & per-slot, warmup20 & 100 & 1 & 103,630 & 53.57 & 199 & 53.01 & 0.56 & 14.0 \\
+GFR $K{=}1$ & per-neuron, warmup20 & 100 & 1 & 105,610 & 52.43 & 189 & 51.73 & 0.70 & 14.0 \\
+APN & act=tanh, better init & 100 & 1 & 103,630 & 53.15 & 168 & 52.50 & 0.65 & 80.1 \\
+APN & act=tanh & 100 & 1 & 103,630 & 51.69 & 162 & 51.16 & 0.53 & 26.2 \\
+APN & $H{=}4$, per-head & 100 & 4 & 103,690 & 10.00$^\dagger$ & --- & 10.00 & --- & 26.1 \\
 \midrule
-\multicolumn{9}{l}{\textit{Width-matched group ($D=100$, no FFN)}} \\
+\multicolumn{10}{l}{\textit{Group 3: Width-matched ($D{=}100$, no FFN)}} \\
 \midrule
-\texttt{deltanet\_D100} & DeltaNet & 100 & 304,610 & 0 & 62.28\% (11) & 60.80\% & 100.4 & 2,133 \\
-\texttt{deltanet\_D100\_warmup20} & DeltaNet & 100 & 304,610 & 20 & 59.26\% (21) & 58.73\% & 100.4 & 2,180 \\
-\texttt{apn\_act-none\_warmup20} & APN (act=none) & 100 & 103,630 & 20 & 58.34\% (189) & 58.17\% & 25.5 & 1,590 \\
+DeltaNet & no warmup & 100 & 1 & 304,610 & 62.28 & 11 & 60.80 & 1.48 & 100.4 \\
+DeltaNet & warmup20 & 100 & 1 & 304,610 & 59.26 & 21 & 58.73 & 0.53 & 100.4 \\
+APN & act=none, warmup20 & 100 & 1 & 103,630 & 58.34 & 189 & 58.17 & 0.17 & 25.5 \\
 \bottomrule
 \end{tabular}%
 }
+
+\smallskip
+{\footnotesize ${}^\dagger$ Diverged to NaN during training (see Section~\ref{sec:nan}).}
 \end{table}
 
-\subsection{Key Observations}
-
-\begin{enumerate}
-\item \textbf{APN with \texttt{act=none} is the best APN variant}, reaching 58.34\% (with warmup) versus 51--53\% for \texttt{act=tanh}. The identity activation (no nonlinearity on keys) allows the model to use the full input range without saturating gradients.
-
-\item \textbf{APN is the most parameter-efficient model.} With only 103K parameters ($1\times$), APN (act=none) achieves 58.34\%. DeltaNet requires $3\times$ the parameters (305K) to reach 62.28\%, and the Transformer requires $12\times$ (1.2M) to reach 63.50\%. Per parameter, APN extracts \textbf{0.56\% accuracy per 1K params}, versus 0.20\% for DeltaNet and 0.053\% for the Transformer.
-
-\item \textbf{APN is uniquely resistant to overfitting.} Table~\ref{tab:results} reveals a striking pattern in the ``Best vs.\ Final'' columns: DeltaNet $D=58$ peaks at epoch~18 then \emph{drops 4.7 points} by epoch 200 (60.06\% $\to$ 55.40\%); Transformer $D=29$ drops 3.9 points (59.75\% $\to$ 55.89\%); DeltaNet $D=100$ drops 1.5 points. In contrast, APN act=none peaks at epoch~189 with its final accuracy only \textbf{0.17 points} below peak. APN does not require early stopping---a significant practical advantage.
-
-\item \textbf{Adding FFN hurts APN but helps DeltaNet.} This is the most surprising result. At $\approx$1.2M params:
-\begin{itemize}
-    \item \textbf{APN + FFN (56.84\%) is \emph{worse} than plain APN (58.34\%)} despite having $12\times$ more parameters. The FFN enables APN to reach 100\% train accuracy (vs.\ 62.9\% without FFN), but this capacity is entirely wasted on memorization---test accuracy \emph{decreases} by 1.5 points.
-    \item \textbf{DeltaNet + FFN (62.80\%) nearly matches the Transformer (63.50\%)}---only 0.7 points behind at equal parameters. Moreover, DeltaNet+FFN stabilizes training: its peak occurs at epoch~198 (vs.\ epoch~11 without FFN) with \emph{zero} peak-to-final drop.
-\end{itemize}
-This suggests APN's single-projection design acts as an \textbf{implicit regularizer}: the $D^2$-parameter bottleneck constrains capacity in a way that prevents overfitting, but also prevents the model from utilizing additional FFN capacity. DeltaNet's richer $3D^2$ attention mechanism can leverage the FFN to close the gap with the Transformer.
-
-\item \textbf{Warmup helps APN but hurts DeltaNet.} DeltaNet $D=100$ without warmup: 62.28\% peak; with 20-epoch warmup: 59.26\% peak---a 3-point \emph{drop}. For APN, warmup provides a modest but consistent gain (58.12\% $\to$ 58.34\%). Interestingly, both DeltaNet+FFN and APN+FFN \emph{do} benefit from warmup (both use 20-epoch warmup and reach stable plateaus).
-
-\item \textbf{APN is the fastest per epoch.} At $\approx$26s/epoch, APN (act=none, $D=100$) is $\approx$4$\times$ faster than DeltaNet ($\approx$100s) and $\approx$1.5$\times$ faster than the Transformer ($\approx$39s) at the same width. Even APN+FFN (55.3s) is faster than DeltaNet without FFN.
-
-\item \textbf{APN uses the least GPU memory.} 1,590 MB vs 2,133 MB (DeltaNet) vs 4,278 MB (Transformer) at $D=100$. With FFN, APN+FFN (4,358 MB) is comparable to the Transformer (4,278 MB)---the FFN dominates memory at this scale.
-\end{enumerate}
-
-% --- Training Curves ---
-\subsection{Training Curves}
+% ============================================================================
+\subsection{Key Finding 1: APN Is the Most Parameter-Efficient Model}
 
 \begin{figure}[h]
 \centering
 \begin{tikzpicture}
 \begin{axis}[
-    width=0.95\textwidth,
+    width=0.85\textwidth,
     height=0.55\textwidth,
     xlabel={Epoch},
     ylabel={Test Accuracy (\%)},
     xmin=0, xmax=200,
-    ymin=10, ymax=67,
+    ymin=35, ymax=62,
     grid=major,
     grid style={gray!30},
-    legend style={at={(0.02,0.98)}, anchor=north west, font=\footnotesize, draw=none, fill=white, fill opacity=0.8},
-    cycle list name=Set1-6,
+    legend style={at={(0.98,0.02)}, anchor=south east, font=\footnotesize, draw=none, fill=white, fill opacity=0.8},
     every axis plot/.append style={thick},
+    title={\textbf{Parameter-matched group ($\approx$103K params, no FFN)}},
+    title style={font=\normalsize},
 ]
 
 \addplot[color=apn-none, thick] table[x=epoch, y=test/acc, col sep=comma]
     {../report_data/apn_L10_D100_H200_B64_act-none_warmup20.csv};
 \addlegendentry{APN act=none (103K)}
 
-\addplot[color=apn-ffn, thick, densely dotted] table[x=epoch, y=test/acc, col sep=comma]
-    {../report_data/apn_L10_D115_H200_B64_ffn_warmup20_paramatch.csv};
-\addlegendentry{APN + FFN D=115 (1.2M)}
-
-\addplot[color=apn-tanh, thick, dashed] table[x=epoch, y=test/acc, col sep=comma]
-    {../report_data/apn_L10_D100_H200_B64_act-tanh.csv};
-\addlegendentry{APN act=tanh (103K)}
-
-\addplot[color=deltanet, thick] table[x=epoch, y=test/acc, col sep=comma]
-    {../report_data/deltanet_L10_D100_H200_B64.csv};
-\addlegendentry{DeltaNet D=100 (305K)}
-
-\addplot[color=deltanet-ffn, thick, densely dotted] table[x=epoch, y=test/acc, col sep=comma]
-    {../report_data/deltanet_L10_D104_H200_B64_ffn_warmup20_paramatch.csv};
-\addlegendentry{DeltaNet + FFN D=104 (1.2M)}
-
-\addplot[color=deltanet-pm, thick, dashed] table[x=epoch, y=test/acc, col sep=comma]
+\addplot[color=deltanet-pm, thick] table[x=epoch, y=test/acc, col sep=comma]
     {../report_data/deltanet_L10_D58_H200_B64.csv};
-\addlegendentry{DeltaNet D=58 param-match (104K)}
+\addlegendentry{DeltaNet D=58 (104K)}
+
+\addplot[color=transformer-pm, thick] table[x=epoch, y=test/acc, col sep=comma]
+    {../report_data/transformer_L10_D29_H200_B64_warmup20_paramatch.csv};
+\addlegendentry{Transformer D=29 (103K)}
+
+\addplot[color=gfr-k4, thick] table[x=epoch, y=test/acc, col sep=comma]
+    {../report_data/gfr_K4_D100_perslot.csv};
+\addlegendentry{GFR K=4 per-slot (104K)}
+
+\addplot[color=gfr-k1, thick, dashed] table[x=epoch, y=test/acc, col sep=comma]
+    {../report_data/gfr_K1_D100.csv};
+\addlegendentry{GFR K=1 (104K)}
+
+\end{axis}
+\end{tikzpicture}
+\caption{Test accuracy for parameter-matched models ($\approx$103K). APN (act=none) converges steadily to 58.3\%, while DeltaNet peaks early (epoch 18) and declines 4.7 points by epoch 200. The Transformer also peaks early (epoch 38) and declines 3.9 points. APN and GFR models show minimal overfitting.}
+\label{fig:paramatch}
+\end{figure}
+
+With only 103K parameters, APN (act=none) achieves 58.34\% test accuracy.
+DeltaNet requires $3\times$ the parameters (305K) to reach 62.28\%, and the Transformer requires $12\times$ (1.2M) to reach 63.50\%.
+Per 1K parameters, APN extracts 0.56\% accuracy, versus 0.20\% for DeltaNet and 0.053\% for the Transformer.
+Moreover, APN's peak occurs at epoch 189 with only a 0.17-point drop by epoch 200---it requires no early stopping.
+In contrast, DeltaNet $D{=}58$ drops 4.66 points and the Transformer $D{=}29$ drops 3.86 points from their peaks.
+
+% ============================================================================
+\subsection{Key Finding 2: FFN Helps DeltaNet and GFR but Hurts APN}
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+    width=0.85\textwidth,
+    height=0.55\textwidth,
+    xlabel={Epoch},
+    ylabel={Test Accuracy (\%)},
+    xmin=0, xmax=200,
+    ymin=35, ymax=67,
+    grid=major,
+    grid style={gray!30},
+    legend style={at={(0.98,0.02)}, anchor=south east, font=\footnotesize, draw=none, fill=white, fill opacity=0.8},
+    every axis plot/.append style={thick},
+    title={\textbf{FFN-augmented group ($\approx$1.2M params)}},
+    title style={font=\normalsize},
+]
 
 \addplot[color=transformer, thick] table[x=epoch, y=test/acc, col sep=comma]
     {../report_data/transformer_L10_D100_H200_B64_warmup20.csv};
 \addlegendentry{Transformer D=100 (1.2M)}
 
-\addplot[color=transformer-pm, thick, dashed] table[x=epoch, y=test/acc, col sep=comma]
-    {../report_data/transformer_L10_D29_H200_B64_warmup20_paramatch.csv};
-\addlegendentry{Transformer D=29 param-match (103K)}
+\addplot[color=deltanet-ffn, thick] table[x=epoch, y=test/acc, col sep=comma]
+    {../report_data/deltanet_L10_D104_H200_B64_ffn_warmup20_paramatch.csv};
+\addlegendentry{DeltaNet+FFN D=104 (1.2M)}
+
+\addplot[color=gfr-ffn, thick] table[x=epoch, y=test/acc, col sep=comma]
+    {../report_data/gfr_K1_D115_ffn.csv};
+\addlegendentry{GFR K=1+FFN D=115 (1.2M)}
+
+\addplot[color=apn-ffn, thick] table[x=epoch, y=test/acc, col sep=comma]
+    {../report_data/apn_L10_D115_H200_B64_ffn_warmup20_paramatch.csv};
+\addlegendentry{APN+FFN D=115 (1.2M)}
+
+\addplot[color=apn-none, thick, dashed] table[x=epoch, y=test/acc, col sep=comma]
+    {../report_data/apn_L10_D100_H200_B64_act-none_warmup20.csv};
+\addlegendentry{APN no-FFN D=100 (103K, reference)}
 
 \end{axis}
 \end{tikzpicture}
-\caption{Test accuracy vs.\ epoch for all key runs. Solid lines: base models; dashed lines: parameter-matched ($\approx$103K); dotted lines: FFN-augmented ($\approx$1.2M). Note: DeltaNet without FFN peaks early (epoch~11--18) then declines, while APN curves rise steadily. APN+FFN (dotted red) \emph{underperforms} plain APN (solid red) despite 12$\times$ more parameters.}
-\label{fig:test_acc}
+\caption{FFN-augmented models at $\approx$1.2M params. DeltaNet+FFN (62.8\%) nearly matches the Transformer (63.5\%). GFR+FFN (58.9\%) benefits from the FFN. Remarkably, APN+FFN (56.8\%, solid dark red) \emph{underperforms} plain APN without FFN (58.3\%, dashed red) despite having 12$\times$ more parameters.}
+\label{fig:ffn}
 \end{figure}
 
-% --- Training loss curves ---
+At $\approx$1.2M parameters, all FFN-augmented models reach 100\% training accuracy.
+The critical difference is generalization:
+\begin{itemize}
+\item \textbf{DeltaNet+FFN (62.80\%)} nearly matches the Transformer (63.50\%), only 0.7 points behind.
+\item \textbf{GFR+FFN (58.93\%)} benefits from the FFN, outperforming plain GFR $K{=}1$ by 5.4 points---and outperforming APN+FFN by 2.1 points.
+\item \textbf{APN+FFN (56.84\%)} is \emph{worse} than plain APN (58.34\%) by 1.5 points despite 12$\times$ more parameters.
+\end{itemize}
+The FFN enables 100\% train accuracy for APN, but this capacity is entirely wasted on memorization.
+APN's single-projection tied key-value design ($\mathbf{k} = \mathbf{v} = W\mathbf{x}$) produces representations too constrained for the FFN to refine productively.
+In contrast, GFR's simpler element-wise recurrence produces features that the FFN can meaningfully transform.
+
+% ============================================================================
+\subsection{Key Finding 3: Multi-Head Improves Transformer and DeltaNet but Destabilizes APN}
+\label{sec:nan}
+
 \begin{figure}[h]
 \centering
 \begin{tikzpicture}
 \begin{axis}[
-    width=0.95\textwidth,
-    height=0.5\textwidth,
+    width=0.85\textwidth,
+    height=0.55\textwidth,
     xlabel={Epoch},
-    ylabel={Test Loss},
+    ylabel={Test Accuracy (\%)},
     xmin=0, xmax=200,
-    ymin=1.0, ymax=2.5,
+    ymin=35, ymax=67,
     grid=major,
     grid style={gray!30},
-    legend style={at={(0.98,0.98)}, anchor=north east, font=\small, draw=none, fill=white, fill opacity=0.8},
+    legend style={at={(0.02,0.98)}, anchor=north west, font=\footnotesize, draw=none, fill=white, fill opacity=0.8},
     every axis plot/.append style={thick},
+    title={\textbf{Multi-head ($H{=}4$) vs.\ single-head ($H{=}1$)}},
+    title style={font=\normalsize},
 ]
 
-\addplot[color=apn-none, thick] table[x=epoch, y=test/loss, col sep=comma]
-    {../report_data/apn_L10_D100_H200_B64_act-none_warmup20.csv};
-\addlegendentry{APN act=none (103K)}
+\addplot[color=transformer, thick] table[x=epoch, y=test/acc, col sep=comma]
+    {../report_data/transformer_D100_H4.csv};
+\addlegendentry{Transformer H=4 (65.2\%)}
 
-\addplot[color=apn-ffn, thick, densely dotted] table[x=epoch, y=test/loss, col sep=comma]
-    {../report_data/apn_L10_D115_H200_B64_ffn_warmup20_paramatch.csv};
-\addlegendentry{APN + FFN (1.2M)}
-
-\addplot[color=apn-tanh, thick, dashed] table[x=epoch, y=test/loss, col sep=comma]
-    {../report_data/apn_L10_D100_H200_B64_act-tanh.csv};
-\addlegendentry{APN act=tanh (103K)}
-
-\addplot[color=deltanet, thick] table[x=epoch, y=test/loss, col sep=comma]
-    {../report_data/deltanet_L10_D100_H200_B64.csv};
-\addlegendentry{DeltaNet D=100 (305K)}
-
-\addplot[color=deltanet-ffn, thick, densely dotted] table[x=epoch, y=test/loss, col sep=comma]
-    {../report_data/deltanet_L10_D104_H200_B64_ffn_warmup20_paramatch.csv};
-\addlegendentry{DeltaNet + FFN (1.2M)}
-
-\addplot[color=transformer, thick] table[x=epoch, y=test/loss, col sep=comma]
+\addplot[color=transformer-pm, thick, dashed] table[x=epoch, y=test/acc, col sep=comma]
     {../report_data/transformer_L10_D100_H200_B64_warmup20.csv};
-\addlegendentry{Transformer D=100 (1.2M)}
+\addlegendentry{Transformer H=1 (63.5\%)}
+
+\addplot[color=deltanet-ffn, thick] table[x=epoch, y=test/acc, col sep=comma]
+    {../report_data/deltanet_D104_H4_ffn.csv};
+\addlegendentry{DeltaNet+FFN H=4 (63.6\%)}
+
+\addplot[color=deltanet-pm, thick, dashed] table[x=epoch, y=test/acc, col sep=comma]
+    {../report_data/deltanet_L10_D104_H200_B64_ffn_warmup20_paramatch.csv};
+\addlegendentry{DeltaNet+FFN H=1 (62.8\%)}
 
 \end{axis}
 \end{tikzpicture}
-\caption{Test loss vs.\ epoch. DeltaNet and DeltaNet+FFN both reach 100\% train accuracy; the FFN stabilizes the test loss. APN+FFN also reaches 100\% train accuracy but its test loss is \emph{higher} than plain APN, confirming the FFN causes overfitting in APN.}
-\label{fig:test_loss}
+\caption{Multi-head ($H{=}4$) vs.\ single-head. Transformer improves from 63.5\% to 65.2\% (+1.7 points). DeltaNet+FFN improves from 62.8\% to 63.6\% (+0.8 points). APN $H{=}4$ diverges to NaN and is not shown (see text).}
+\label{fig:multihead}
 \end{figure}
 
-% --- Scalar dynamics ---
+Multi-head attention ($H{=}4$) benefits the Transformer (+1.66 points, from 63.50\% to 65.16\%) and DeltaNet+FFN (+0.76 points, from 62.80\% to 63.56\%).
+However, \textbf{both multi-head APN runs diverged completely}:
+
+\begin{itemize}
+\item \textbf{APN $H{=}4$ without FFN} ($D{=}100$): NaN from epoch 1. All scalars immediately become NaN.
+\item \textbf{APN $H{=}4$ with FFN} ($D{=}116$): Trains for 9 epochs (peak 40.6\% at epoch 9), then NaN at epoch 10. The scalar logs reveal that head~3's $\eta$ (initialized at 0.1) \emph{goes negative} ($-0.12$ at epoch 9), causing the Hebbian update to amplify rather than correct errors. Meanwhile, head~0's $\eta$ (initialized at 1.0 with $\lambda{=}0.999$) grows unboundedly ($1.08$ at epoch 9).
+\end{itemize}
+
+\textbf{Root cause analysis.} With $H{=}4$, each head operates on a $D/H = 25$-dimensional subspace with a $25 \times 25$ state matrix.
+The Hebbian outer-product update $\mathbf{k}_t \otimes (\mathbf{v}_t - S_{t-1}^\top \mathbf{k}_t)$ amplifies noise when:
+(1)~the per-head dimension is too small, making the rank-1 update dominate the state;
+(2)~$\eta$ is unconstrained and can go negative, reversing the sign of the delta correction;
+(3)~$\lambda{=}0.9$ (head~2's initialization) provides insufficient damping, so errors accumulate rapidly.
+For the no-FFN variant, the $25{\times}25$ state is so small that the system is unstable from the first gradient step.
+These issues do not affect DeltaNet because its $\beta_t = \sigma(\cdot) \in (0,1)$ is always positive and bounded.
+
+% ============================================================================
+\subsection{Key Finding 4: GFR Validates the Importance of APN's Matrix State}
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+    width=0.85\textwidth,
+    height=0.55\textwidth,
+    xlabel={Epoch},
+    ylabel={Test Accuracy (\%)},
+    xmin=0, xmax=200,
+    ymin=35, ymax=60,
+    grid=major,
+    grid style={gray!30},
+    legend style={at={(0.98,0.02)}, anchor=south east, font=\footnotesize, draw=none, fill=white, fill opacity=0.8},
+    every axis plot/.append style={thick},
+    title={\textbf{APN vs.\ GFR variants ($\approx$103K params, no FFN)}},
+    title style={font=\normalsize},
+]
+
+\addplot[color=apn-none, thick] table[x=epoch, y=test/acc, col sep=comma]
+    {../report_data/apn_L10_D100_H200_B64_act-none_warmup20.csv};
+\addlegendentry{APN act=none (58.3\%)}
+
+\addplot[color=gfr-k4, thick] table[x=epoch, y=test/acc, col sep=comma]
+    {../report_data/gfr_K4_D100_perslot.csv};
+\addlegendentry{GFR K=4 per-slot (56.0\%)}
+
+\addplot[color=gfr-k4, thick, dashed] table[x=epoch, y=test/acc, col sep=comma]
+    {../report_data/gfr_K4_D100_perneuron.csv};
+\addlegendentry{GFR K=4 per-neuron (56.2\%)}
+
+\addplot[color=gfr-k1, thick] table[x=epoch, y=test/acc, col sep=comma]
+    {../report_data/gfr_K1_D100.csv};
+\addlegendentry{GFR K=1 per-slot (53.6\%)}
+
+\addplot[color=gfr-k1, thick, dashed] table[x=epoch, y=test/acc, col sep=comma]
+    {../report_data/gfr_K1_D100_perneuron.csv};
+\addlegendentry{GFR K=1 per-neuron (52.4\%)}
+
+\end{axis}
+\end{tikzpicture}
+\caption{APN vs.\ GFR variants at matched parameters. APN's $D{\times}D$ matrix state outperforms GFR's scalar memory slots by 2.3--5.9 points. Adding slots ($K{=}4$) helps significantly (+2.4 points over $K{=}1$), partially compensating for the lack of associative capacity. Per-neuron parameterization offers no clear advantage over per-slot.}
+\label{fig:gfr}
+\end{figure}
+
+GFR serves as an ablation of APN, replacing the $D \times D$ matrix state with $K$ independent exponentially-decaying scalar memories.
+The results confirm that \textbf{APN's matrix state provides meaningful associative capacity}:
+\begin{itemize}
+\item GFR $K{=}1$: 53.57\% ($-4.8$ points vs.\ APN). A single exponential decay cannot perform the delta-rule error correction.
+\item GFR $K{=}4$ per-slot: 56.00\% ($-2.3$ points). Multiple timescales partially compensate by allowing the model to store short- and long-term features simultaneously.
+\item GFR $K{=}4$ per-neuron: 56.21\% ($-2.1$ points). Per-neuron parameters (800 extra per layer) do not meaningfully outperform the simpler per-slot parameterization (8 extra per layer).
+\item GFR $K{=}1$ per-neuron: 52.43\% ($-5.9$ points). Worse than per-slot $K{=}1$, suggesting that per-neuron decay rates with a single slot overfit.
+\end{itemize}
+
+GFR is significantly faster than APN: 14.0 s/epoch for $K{=}1$ (vs.\ 25.5 s for APN) and 22.7 s for $K{=}4$.
+The HGRN kernel's element-wise scan is computationally trivial compared to APN's tiled $D \times D$ delta-rule computation.
+
+% ============================================================================
+\subsection{Key Finding 5: Loss--Accuracy Divergence in Overparameterized Models}
+\label{sec:loss_divergence}
+
+\begin{figure}[h]
+\centering
+\begin{subfigure}[b]{0.48\textwidth}
+\begin{tikzpicture}
+\begin{axis}[
+    width=\textwidth,
+    height=0.75\textwidth,
+    xlabel={Epoch},
+    ylabel={Test Accuracy (\%)},
+    xmin=0, xmax=200,
+    ymin=35, ymax=67,
+    grid=major,
+    grid style={gray!30},
+    legend style={at={(0.98,0.02)}, anchor=south east, font=\tiny, draw=none, fill=white, fill opacity=0.8},
+    every axis plot/.append style={thick},
+]
+\addplot[color=transformer, thick] table[x=epoch, y=test/acc, col sep=comma]
+    {../report_data/transformer_D100_H4.csv};
+\addlegendentry{Transformer H=4}
+\addplot[color=deltanet-ffn, thick] table[x=epoch, y=test/acc, col sep=comma]
+    {../report_data/deltanet_D104_H4_ffn.csv};
+\addlegendentry{DeltaNet+FFN H=4}
+\addplot[color=gfr-ffn, thick] table[x=epoch, y=test/acc, col sep=comma]
+    {../report_data/gfr_K1_D115_ffn.csv};
+\addlegendentry{GFR+FFN}
+\end{axis}
+\end{tikzpicture}
+\caption{Test accuracy continues improving}
+\end{subfigure}
+\hfill
+\begin{subfigure}[b]{0.48\textwidth}
+\begin{tikzpicture}
+\begin{axis}[
+    width=\textwidth,
+    height=0.75\textwidth,
+    xlabel={Epoch},
+    ylabel={Test Loss (CE)},
+    xmin=0, xmax=200,
+    ymin=0.5, ymax=6.0,
+    grid=major,
+    grid style={gray!30},
+    legend style={at={(0.02,0.98)}, anchor=north west, font=\tiny, draw=none, fill=white, fill opacity=0.8},
+    every axis plot/.append style={thick},
+]
+\addplot[color=transformer, thick] table[x=epoch, y=test/loss, col sep=comma]
+    {../report_data/transformer_D100_H4.csv};
+\addlegendentry{Transformer H=4}
+\addplot[color=deltanet-ffn, thick] table[x=epoch, y=test/loss, col sep=comma]
+    {../report_data/deltanet_D104_H4_ffn.csv};
+\addlegendentry{DeltaNet+FFN H=4}
+\addplot[color=gfr-ffn, thick] table[x=epoch, y=test/loss, col sep=comma]
+    {../report_data/gfr_K1_D115_ffn.csv};
+\addlegendentry{GFR+FFN}
+\end{axis}
+\end{tikzpicture}
+\caption{Test loss diverges to $\sim$5.0--5.5}
+\end{subfigure}
+\caption{Loss--accuracy divergence in overparameterized models. All three models reach 100\% train accuracy and develop increasingly confident predictions. On test samples where the model is wrong, the large logit magnitudes produce enormous cross-entropy loss. Since accuracy only measures correct/incorrect (not confidence), test accuracy can improve even as test loss explodes. Final test losses: Transformer H=4: 5.49, DeltaNet+FFN H=4: 5.19, GFR+FFN: 5.31.}
+\label{fig:loss_divergence}
+\end{figure}
+
+A striking phenomenon in our experiments: models that achieve 100\% training accuracy show test loss climbing to $\sim$5.0--5.5 in later epochs, while test accuracy remains stable or even improves slightly.
+This occurs in the Transformer ($H{=}4$: final test loss 5.49, acc 65.1\%), DeltaNet+FFN ($H{=}4$: loss 5.19, acc 63.4\%), and GFR+FFN (loss 5.31, acc 58.8\%).
+
+\textbf{Explanation.} Cross-entropy loss is $-\log p_{\text{correct}}$.
+When a model reaches 100\% train accuracy with near-zero train loss ($\sim 10^{-9}$), its logits become very large in magnitude.
+On test samples, the model is still correct on $\sim$63--65\% of examples (producing near-zero per-sample loss for those), but for the $\sim$35\% of misclassified samples, the large logit magnitudes mean the model is \emph{confidently wrong}, yielding per-sample losses of $\sim$15--20.
+The mean across all samples produces the observed $\sim$5.0 test loss.
+Accuracy only counts the argmax and is insensitive to confidence, so it remains stable.
+
+\textbf{Notably, APN and GFR without FFN never exhibit this divergence} (final test losses $\sim$1.2--1.3) because they cannot reach 100\% train accuracy---their implicit regularization prevents the logit magnitudes from growing unboundedly.
+
+% ============================================================================
+\subsection{Speed and Memory Comparison}
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+    ybar,
+    width=0.95\textwidth,
+    height=0.4\textwidth,
+    ylabel={Epoch Time (seconds)},
+    symbolic x coords={GFR K1\\D100, GFR K4\\D100, APN\\D100, Transf.\\D29, Transf.\\D100, GFR+FFN\\D115, APN+FFN\\D115, DN+FFN\\D104, DN\\D58, Transf.H4\\D100, DN\\D100},
+    xtick=data,
+    x tick label style={align=center, font=\scriptsize},
+    ymin=0, ymax=120,
+    bar width=12pt,
+    nodes near coords,
+    nodes near coords style={font=\tiny, above},
+    grid=major,
+    grid style={gray!30, dashed},
+]
+\addplot[fill=gfr-k1!80] coordinates {
+    (GFR K1\\D100, 14.0)
+    (GFR K4\\D100, 22.7)
+    (APN\\D100, 25.5)
+    (Transf.\\D29, 32.6)
+    (Transf.\\D100, 39.3)
+    (GFR+FFN\\D115, 33.3)
+    (APN+FFN\\D115, 55.3)
+    (DN+FFN\\D104, 112.1)
+    (DN\\D58, 69.0)
+    (Transf.H4\\D100, 85.1)
+    (DN\\D100, 100.4)
+};
+\end{axis}
+\end{tikzpicture}
+\caption{Training time per epoch (lower is better). GFR $K{=}1$ is the fastest (14s), followed by GFR $K{=}4$ (23s) and APN (26s). DeltaNet is consistently the slowest due to its Triton kernel overhead at these dimensions.}
+\label{fig:epoch_time}
+\end{figure}
+
+\begin{table}[h]
+\centering
+\caption{Speed and memory comparison for key configurations.}
+\label{tab:speed_memory}
+\begin{tabular}{lccc}
+\toprule
+\textbf{Model (params)} & \textbf{s/epoch} & \textbf{Peak GPU (MB)} & \textbf{Relative speed} \\
+\midrule
+GFR $K{=}1$ $D{=}100$ (104K) & 14.0 & 1,460 & 1.0$\times$ (fastest) \\
+GFR $K{=}4$ $D{=}100$ (104K) & 22.7 & 3,154 & 1.6$\times$ \\
+APN $D{=}100$ (104K) & 25.5 & 1,590 & 1.8$\times$ \\
+Transformer $D{=}29$ (103K) & 32.6 & 4,623 & 2.3$\times$ \\
+Transformer $D{=}100$ (1.2M) & 39.3 & 4,278 & 2.8$\times$ \\
+DeltaNet $D{=}58$ (104K) & 69.0 & 1,151 & 4.9$\times$ \\
+DeltaNet $D{=}100$ (305K) & 100.4 & 2,133 & 7.2$\times$ \\
+Transformer $H{=}4$ $D{=}100$ (1.2M) & 85.1 & 17,158 & 6.1$\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Key observations:
+\begin{itemize}
+\item \textbf{GFR $K{=}1$ is fastest} at 14s/epoch---$1.8\times$ faster than APN and $7\times$ faster than DeltaNet.
+\item \textbf{APN is 4$\times$ faster than DeltaNet} at the same width ($D{=}100$), due to its single projection vs.\ three.
+\item \textbf{Transformer $H{=}4$ uses 17 GB} GPU memory---$4\times$ more than $H{=}1$ (4.3 GB)---because FlashAttention-2's $H{=}4$ configuration stores more intermediate activations for the backward pass.
+\item \textbf{GFR $K{=}4$ uses 3.2 GB}---$2\times$ more than $K{=}1$ (1.5 GB)---proportional to the $4\times$ larger state vector.
+\end{itemize}
+
+% ============================================================================
+\subsection{APN Scalar Dynamics}
+
 \begin{figure}[h]
 \centering
 \begin{subfigure}[b]{0.48\textwidth}
@@ -361,7 +610,7 @@ This suggests APN's single-projection design acts as an \textbf{implicit regular
 \addlegendentry{Layer 9}
 \end{axis}
 \end{tikzpicture}
-\caption{Learned $\eta$ (APN act=none, warmup20)}
+\caption{Learned $\eta$ (APN act=none)}
 \end{subfigure}
 \hfill
 \begin{subfigure}[b]{0.48\textwidth}
@@ -386,89 +635,70 @@ This suggests APN's single-projection design acts as an \textbf{implicit regular
 \addlegendentry{Layer 9}
 \end{axis}
 \end{tikzpicture}
-\caption{Learned $\lambda$ (APN act=none, warmup20)}
+\caption{Learned $\lambda$ (APN act=none)}
 \end{subfigure}
-\caption{Evolution of trainable APN scalars $\eta$ and $\lambda$ during training (layers 0 and 9). Both parameters remain close to their initial values ($\eta=1.0$, $\lambda=0.999$), suggesting the initialization is already near-optimal for this task.}
+\caption{Evolution of APN scalars during training. Both $\eta$ and $\lambda$ remain close to their initializations ($\eta{=}1.0$, $\lambda{=}0.999$), confirming the initialization is near-optimal. $\lambda$ converges toward 1.0 (minimal forgetting), consistent with the Seq-CIFAR-10 task requiring information from the entire 1024-step sequence.}
 \label{fig:scalars}
 \end{figure}
 
-% --- Speed/Memory comparison ---
-\subsection{Speed and Memory Comparison}
+% ============================================================================
+\section{Activation Function Analysis}
 
-\begin{figure}[h]
+\begin{table}[h]
 \centering
-\begin{tikzpicture}
-\begin{axis}[
-    ybar,
-    width=0.95\textwidth,
-    height=0.45\textwidth,
-    ylabel={Epoch Time (seconds)},
-    symbolic x coords={APN\\D100, APN+FFN\\D115, DeltaNet\\D58, DeltaNet\\D100, DN+FFN\\D104, Transf.\\D29, Transf.\\D100},
-    xtick=data,
-    x tick label style={align=center, font=\small},
-    ymin=0, ymax=130,
-    bar width=18pt,
-    nodes near coords,
-    nodes near coords style={font=\scriptsize, above},
-    every node near coord/.append style={anchor=south},
-    grid=major,
-    grid style={gray!30, dashed},
-]
-\addplot[fill=apn-none!80] coordinates {
-    (APN\\D100, 25.5)
-    (APN+FFN\\D115, 55.3)
-    (DeltaNet\\D58, 69.0)
-    (DeltaNet\\D100, 100.4)
-    (DN+FFN\\D104, 112.1)
-    (Transf.\\D29, 32.6)
-    (Transf.\\D100, 39.3)
-};
-\end{axis}
-\end{tikzpicture}
-\caption{Training time per epoch (lower is better). Plain APN at $D=100$ is $\approx$4$\times$ faster than DeltaNet and $\approx$1.5$\times$ faster than the Transformer at the same width. Even APN+FFN (55.3s) is faster than DeltaNet without FFN (100.4s).}
-\label{fig:epoch_time}
-\end{figure}
+\caption{Effect of activation function on APN performance ($D=100$, $L=10$, 200 epochs).}
+\label{tab:activations}
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Activation} & \textbf{Best Test Acc} & \textbf{Best Ep} & \textbf{Train Acc (final)} & \textbf{Notes} \\
+\midrule
+\texttt{none} (identity, warmup) & \textbf{58.34\%} & 189 & 62.92\% & Best; no gradient saturation \\
+\texttt{none} (no warmup) & 58.12\% & 163 & 61.84\% & Slightly worse without warmup \\
+\texttt{tanh} (better init) & 53.15\% & 168 & 70.24\% & Overfits more; bounded keys \\
+\texttt{tanh} (default init) & 51.69\% & 162 & 62.05\% & Baseline \\
+\texttt{tanh} (frozen $\lambda$) & 49.54\% & --- & 61.21\% & Freezing $\lambda$ hurts \\
+\bottomrule
+\end{tabular}
+\end{table}
 
-\begin{figure}[h]
+The identity activation (\texttt{none}) outperforms \texttt{tanh} by 5--6 points.
+\texttt{tanh} saturates for large inputs, compressing the key space and limiting the memory matrix's ability to distinguish similar inputs.
+Notably, the best \texttt{tanh} variant (better init, 53.15\%) overfits more heavily: 70.24\% final train accuracy vs.\ only 62.92\% for \texttt{act=none}.
+
+% ============================================================================
+\section{Computational Complexity}
+
+\begin{table}[h]
 \centering
-\begin{tikzpicture}
-\begin{axis}[
-    ybar,
-    width=0.95\textwidth,
-    height=0.45\textwidth,
-    ylabel={Peak GPU Memory (MB)},
-    symbolic x coords={APN\\D100, APN+FFN\\D115, DeltaNet\\D58, DeltaNet\\D100, DN+FFN\\D104, Transf.\\D29, Transf.\\D100},
-    xtick=data,
-    x tick label style={align=center, font=\small},
-    ymin=0, ymax=5500,
-    bar width=18pt,
-    nodes near coords,
-    nodes near coords style={font=\scriptsize, above},
-    every node near coord/.append style={anchor=south},
-    grid=major,
-    grid style={gray!30, dashed},
-]
-\addplot[fill=deltanet!80] coordinates {
-    (APN\\D100, 1590)
-    (APN+FFN\\D115, 4358)
-    (DeltaNet\\D58, 1151)
-    (DeltaNet\\D100, 2133)
-    (DN+FFN\\D104, 4647)
-    (Transf.\\D29, 4623)
-    (Transf.\\D100, 4278)
-};
-\end{axis}
-\end{tikzpicture}
-\caption{Peak GPU memory (lower is better). Plain APN uses $\approx$2.7$\times$ less memory than the Transformer at $D=100$. With FFN, all three models converge to $\approx$4.3--4.6 GB as the FFN dominates memory.}
-\label{fig:gpu_mem}
-\end{figure}
+\caption{Theoretical complexity per layer. $T$: sequence length, $D$: hidden dim, $C$: chunk size (64).}
+\label{tab:complexity}
+\begin{tabular}{lcc}
+\toprule
+\textbf{Model} & \textbf{Time} & \textbf{Memory (state)} \\
+\midrule
+Transformer (softmax) & $O(T^2 D + T D^2)$ & $O(T^2)$ per head${}^\dagger$ \\
+DeltaNet / APN (chunked) & $O(TCD + TD^2/C)$ & $O(D^2)$ per head \\
+DeltaNet / APN (recurrent) & $O(TD^2)$ & $O(D^2)$ per head \\
+GFR (HGRN, chunked) & $O(TDK)$ & $O(DK)$ \\
+\bottomrule
+\end{tabular}
+
+\smallskip
+{\footnotesize ${}^\dagger$ FlashAttention-2 reduces HBM traffic to $O(T)$ but FLOPs remain $O(T^2)$.}
+\end{table}
+
+\textbf{Why APN/DeltaNet can be faster.}
+For $T=1024$, $D=100$: the softmax attention FLOPs scale as $T^2 D = 1024^2 \times 100 \approx 10^8$, while the chunked delta-rule scales as $TCD = 1024 \times 64 \times 100 \approx 6.5 \times 10^6$ --- a $\approx 15\times$ reduction in the attention-like computation.
+However, the APN/DeltaNet kernels are Triton-based (less mature than FlashAttention's hand-tuned CUDA), and at small $D$ the linear projections dominate, so the wall-clock advantage depends on the specific configuration.
+
+For \textbf{inference}, the advantage is even clearer: APN/DeltaNet/GFR maintain a fixed-size state (constant memory), while the Transformer's KV cache grows linearly with sequence length.
 
 % ============================================================================
 \section{GPU Kernel Implementation and the Chunk Method}
 \label{sec:kernels}
 
-A critical contributor to APN/DeltaNet's practical speed is the \textbf{fused Triton kernel} implementation from the Flash Linear Attention (FLA) library.
-This section explains the GPU execution model, contrasts a naive PyTorch implementation with the kernel-based approach, and details the chunk algorithm that enables efficient training.
+A critical contributor to APN/DeltaNet/GFR's practical speed is the \textbf{fused Triton kernel} implementation from the Flash Linear Attention (FLA) library.
+This section explains the GPU execution model, contrasts a naive PyTorch implementation with the kernel-based approach, and details the chunk algorithm.
 
 \subsection{GPU Memory Hierarchy}
 
@@ -507,8 +737,13 @@ B \times T \times D^2 \times 4\,\text{bytes} \times L = 64 \times 1024 \times 10
 \end{itemize}
 
 \textbf{Fused kernel implementation.}
-The FLA library replaces this loop with a compact Triton kernel pipeline.
-In our experiments, DeltaNet uses the \texttt{fused\_recurrent\_delta\_rule} kernel (a single-kernel scan), while APN uses the \texttt{chunk\_gated\_delta\_rule} operator (a multi-kernel pipeline computing gates, intra-chunk WY terms, inter-chunk state propagation, and outputs).
+The FLA library replaces this loop with compact Triton kernel pipelines:
+\begin{itemize}
+\item \textbf{APN}: \texttt{chunk\_gated\_delta\_rule} --- a multi-kernel pipeline computing gates, intra-chunk WY terms, inter-chunk state propagation, and outputs.
+\item \textbf{GFR}: \texttt{chunk\_hgrn} --- simple element-wise gated prefix scan (trivially parallel within chunks).
+\item \textbf{DeltaNet}: \texttt{fused\_recurrent\_delta\_rule} --- a single-kernel sequential scan.
+\end{itemize}
+
 The improvements are:
 \begin{enumerate}
 \item \textbf{A handful of kernel launches} instead of 7{,}168, eliminating launch overhead.
@@ -558,6 +793,8 @@ Chunk ($C=64$) & $T/C = 16$ & $T/C \times D^2$ & $T/C$ boundary states \\
 The chunk method's advantage grows with sequence length: at $T=8192$, the sequential depth is 128 (vs.\ 8192); at $T=65536$ it is 1024 (vs.\ 65536).
 For the backward pass, only $T/C$ boundary states need to be stored---a $64\times$ reduction compared to the naive approach.
 
+\textbf{GFR's simplicity.} The HGRN kernel used by GFR performs an element-wise gated scan (each neuron independently), which is trivially parallelizable within chunks and requires no WY transform or triangular solve. This explains why GFR $K{=}1$ (14\,s/epoch) is even faster than APN (25.5\,s/epoch) despite using the same chunk infrastructure.
+
 \subsection{Tile Alignment and Performance Cliffs}
 
 The chunk kernel processes the $D \times D$ state in tiles (typically $64 \times 64$ blocks).
@@ -582,18 +819,18 @@ $D$ & Tiles/dim & Tile blocks & Padding waste & Relative efficiency \\
 
 For $D=100$: $\lceil 100/64 \rceil = 2$ tiles per dimension $\to 4$ tile blocks.
 For $D=173$: $\lceil 173/64 \rceil = 3$ tiles $\to 9$ blocks, plus padding waste and reduced occupancy.
-This explains the $\approx$10$\times$ slowdown from $D=100$ (26\,s/epoch) to $D=173$ (453\,s/epoch) observed in the APN tanh experiment---far worse than the $1.7^2 \approx 3\times$ ratio of $D^2$ arithmetic alone.
+This explains the $\approx$18$\times$ slowdown from $D=100$ (25.5\,s/epoch) to $D=173$ (452.8\,s/epoch) observed in our APN experiments---far worse than the $1.73^2 \approx 3\times$ ratio of $D^2$ arithmetic alone.
 
 \textbf{Recommendation:} For efficient Triton kernel execution, prefer tile-aligned dimensions $D \in \{64, 128, 192, 256\}$ or small dimensions with only 2 tiles per axis ($D \le 128$).
 
 \subsection{Why APN Is Faster Than DeltaNet and the Transformer}
 
-Beyond the shared kernel infrastructure, three factors explain APN's additional speed advantage:
+Beyond the shared kernel infrastructure, three factors explain APN's speed advantage:
 
 \begin{enumerate}
 \item \textbf{Fewer projections.}
 APN uses a single $D \times D$ projection per layer; DeltaNet uses three ($W_Q, W_K, W_V$); the Transformer uses four projections plus a $D \to 4D \to D$ FFN.
-At $D=100$: APN computes 10K multiply-adds per layer; DeltaNet 30K; the Transformer 120K.
+At $D=100$: APN computes 10K multiply-adds per token per layer; DeltaNet 30K; the Transformer 120K.
 
 \item \textbf{Compact recurrent state.}
 APN/DeltaNet store a $D \times D$ state ($\approx$40\,KB at $D=100$ in FP32).
@@ -601,7 +838,7 @@ The Transformer must store Q/K/V activations proportional to $T$ for the backwar
 
 \item \textbf{Linear vs.\ quadratic complexity in $T$.}
 Softmax attention (even with FlashAttention) is $O(T^2 D)$; the chunked delta rule is $O(TCD + TD^2/C)$---linear in $T$.
-At $T=1024, D=100$: attention FLOPs are $\approx 15\times$ fewer for APN.
+At $T=1024, D=100$: attention FLOPs are $\approx 15\times$ higher for the Transformer.
 \end{enumerate}
 
 \textbf{Caveat:} FlashAttention-2 is implemented in hand-tuned CUDA, achieving near-peak throughput.
@@ -609,313 +846,381 @@ The FLA kernels are Triton-based (correct but not fully optimized for Hopper).
 As $T$ grows beyond 4096, the $O(T)$ vs.\ $O(T^2)$ gap dominates regardless of kernel maturity.
 
 \textbf{Note on Triton version:} We pin \texttt{triton>=3.3.0,<3.4.0} due to a known correctness bug in the gated chunk backward kernel on Hopper GPUs with Triton $\ge$3.4 (FLA issue \#640).
-Triton 3.3 generates correct code and runs \emph{faster} on H200 (26\,s/epoch) than on A100 with Triton 3.6 (33\,s/epoch), as Hopper's raw hardware advantages (more SMs, higher bandwidth, 228\,KB shared memory) compensate for missing compiler optimizations.
+Triton 3.3 generates correct code and runs \emph{faster} on H200 (25.5\,s/epoch for APN) than on A100 with Triton 3.6, as Hopper's raw hardware advantages (more SMs, higher bandwidth, 228\,KB shared memory) compensate for missing compiler optimizations.
 
 % ============================================================================
-\section{Activation Function Analysis}
+\section{Discussion}
 
-\begin{table}[h]
-\centering
-\caption{Effect of activation function on APN performance ($D=100$, $L=10$, 200 epochs).}
-\label{tab:activations}
-\begin{tabular}{lcccc}
-\toprule
-\textbf{Activation} & \textbf{Best Test Acc} & \textbf{Best Ep} & \textbf{Train Acc (final)} & \textbf{Notes} \\
-\midrule
-\texttt{none} (identity, warmup) & \textbf{58.34\%} & 189 & 62.92\% & Best; no gradient saturation \\
-\texttt{none} (no warmup) & 58.12\% & 163 & 61.84\% & Slightly worse without warmup \\
-\texttt{tanh} ($\lambda=0.999, \eta=1.0$) & 53.15\% & 168 & 70.24\% & Overfits more; bounded keys \\
-\texttt{tanh} ($\lambda=0.99, \eta=0.01$) & 51.69\% & 162 & 62.05\% & Baseline init \\
-\texttt{tanh} (frozen $\lambda$) & 49.91\% & 157 & 61.21\% & Freezing $\lambda$ hurts \\
-\bottomrule
-\end{tabular}
-\end{table}
+\subsection{Why APN's Implicit Regularization Resists Scaling}
 
-The identity activation (\texttt{none}) outperforms \texttt{tanh} by $\approx$5--6 percentage points.
-This is likely because \texttt{tanh} saturates for large inputs, compressing the key space and limiting the memory matrix's ability to distinguish similar inputs.
-With \texttt{act=none}, keys are the raw pre-activations, preserving the full dynamic range.
-Notably, even the best \texttt{tanh} variant (with better initialization, 53.15\%) overfits heavily: its final train accuracy is 70.24\% vs.\ only 62.92\% for \texttt{act=none}, indicating \texttt{tanh} memorizes the training set without generalizing.
+APN's $D^2$-parameter single-projection design acts as a strong implicit regularizer: the model cannot memorize the training set (final train accuracy: 63\%), which forces it to learn generalizable features.
+However, this same bottleneck prevents APN from leveraging additional capacity via FFN, multi-head splitting, or larger $D$.
+The fundamental limitation is the \emph{tied key-value representation}: $\mathbf{k} = \mathbf{v} = W\mathbf{x}$ constrains the feature space in a way that neither FFN post-processing nor head diversity can overcome.
 
-% ============================================================================
-\section{FFN Experiment Analysis}
+\subsection{GFR as a Minimal Baseline}
 
-To isolate the contribution of the feedforward network (FFN), we added a pre-norm FFN block ($D \to 4D \to D$, GELU activation) after each APN or DeltaNet layer, matching the total parameter count to the Transformer at $\approx$1.2M. The results are shown in the $\approx$1.2M group of Table~\ref{tab:results}.
+GFR demonstrates that even a trivial element-wise gated recurrence (14 s/epoch, simplest possible kernel) can achieve 53--56\% accuracy---only 2--5 points below APN.
+The gap confirms that APN's $D{\times}D$ matrix state provides genuine associative capacity (the ability to store and retrieve key-value associations via the delta rule), not just temporal integration.
+Interestingly, GFR+FFN (58.9\%) outperforms APN+FFN (56.8\%), suggesting that the FFN can compensate for a simpler recurrence more easily than it can augment a constrained one.
 
-\begin{table}[h]
-\centering
-\caption{FFN experiment results ($\approx$1.2M params, 200 epochs, 20-epoch warmup). ``Drop'' = peak $-$ final test accuracy.}
-\label{tab:ffn}
-\begin{tabular}{lcccccc}
-\toprule
-\textbf{Model} & \textbf{$D$} & \textbf{Best Test Acc (Ep)} & \textbf{Final Train} & \textbf{Drop} & \textbf{Time/ep} & \textbf{GPU (MB)} \\
-\midrule
-Transformer & 100 & \textbf{63.50\%} (180) & 100\% & 0.04 & 39.3s & 4,278 \\
-DeltaNet + FFN & 104 & 62.80\% (198) & 100\% & 0.00 & 112.1s & 4,647 \\
-APN + FFN & 115 & 56.84\% (177) & 100\% & 0.16 & 55.3s & 4,358 \\
-\midrule
-APN (no FFN) & 100 & 58.34\% (189) & 62.9\% & 0.17 & 25.5s & 1,590 \\
-\bottomrule
-\end{tabular}
-\end{table}
+\subsection{The Multi-Head Stability Problem}
 
-\textbf{Why does the FFN hurt APN?} All three models with $\approx$1.2M parameters reach 100\% training accuracy, confirming they have sufficient capacity to memorize the dataset. The critical difference is in test generalization:
-\begin{itemize}
-\item The \textbf{Transformer} and \textbf{DeltaNet+FFN} generalize well despite memorizing: their attention mechanisms (softmax QKV or delta-rule QKV with separate Q/K/V projections) learn useful representations that the FFN can refine.
-\item \textbf{APN+FFN} fails to generalize: the APN layer's single-projection design ($\mathbf{k} = \mathbf{v} = W \cdot \mathbf{x}$, sharing keys and values) produces representations that are too constrained for the FFN to improve. The FFN instead learns to memorize training-specific patterns.
-\item \textbf{Plain APN without FFN} actually performs \emph{better} (58.34\% vs.\ 56.84\%) because its limited capacity (63\% train acc) forces it to learn more generalizable features. This $D^2$-parameter bottleneck acts as a form of \textbf{implicit regularization}.
-\end{itemize}
-
-This result highlights a fundamental architectural difference: DeltaNet's separate Q, K, V projections ($3D^2$) create a richer feature space that benefits from FFN post-processing, while APN's tied key-value design ($D^2$) does not.
-
-% ============================================================================
-\section{Ongoing Experiments: Multi-Head APN}
-\label{sec:multihead}
-
-To test whether splitting the hidden dimension into multiple independent heads improves representation diversity, we are currently running four multi-head experiments ($H=4$) with per-head initialization of the plasticity parameters $\lambda$ and $\eta$:
-
-\begin{table}[h]
-\centering
-\caption{Multi-head experiments in progress ($H=4$, $L=10$, 200 epochs, 20-epoch warmup).}
-\label{tab:multihead_runs}
-\begin{tabular}{llcccc}
-\toprule
-\textbf{Run Name} & \textbf{Model} & \textbf{$D$} & \textbf{$H$} & \textbf{Params} & \textbf{Notes} \\
-\midrule
-\texttt{transformer\_D100\_H4} & Transformer & 100 & 4 & 1,205,610 & Reference (same arch as $H=1$) \\
-\texttt{deltanet\_D104\_H4\_ffn} & DeltaNet + FFN & 104 & 4 & 1,199,754 & Param-matched to Transformer \\
-\texttt{apn\_D116\_H4\_ffn\_perhead} & APN + FFN & 116 & 4 & 1,217,626 & Per-head $\lambda/\eta$ \\
-\texttt{apn\_D100\_H4\_perhead} & APN (no FFN) & 100 & 4 & 103,690 & Per-head $\lambda/\eta$ \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-\textbf{Per-head initialization strategy.} Each of the 4 heads is initialized with a different combination of decay rate $\lambda$ and learning rate $\eta$, encouraging specialization:
-\begin{itemize}
-\item Head 0: $\lambda=0.999$, $\eta=1.0$ \quad (slow decay, strong learning --- long-term memory)
-\item Head 1: $\lambda=0.99$, $\eta=1.0$ \quad (medium decay, strong learning)
-\item Head 2: $\lambda=0.9$, $\eta=1.0$ \quad (fast decay, strong learning --- short-term memory)
-\item Head 3: $\lambda=0.999$, $\eta=0.1$ \quad (slow decay, weak learning --- slow integrator)
-\end{itemize}
-All parameters remain trainable; the diverse initialization seeds encourage different heads to specialize in different temporal scales.
-Both $\lambda$ and $\eta$ are now per-head vectors (dimension $[H]$) rather than scalars.
-
-\textbf{Hypotheses:}
-\begin{enumerate}
-\item Multi-head APN without FFN may outperform single-head APN (58.34\%) by capturing both short- and long-range dependencies simultaneously.
-\item Multi-head APN+FFN may overcome the FFN memorization problem if heads provide sufficiently diverse features for the FFN to combine.
-\item Multi-head DeltaNet+FFN and Transformer should be similar to their $H=1$ counterparts (or slightly better), since multi-head attention is standard for these architectures.
-\end{enumerate}
-
-Results will be added to this section once the experiments complete.
-
-% ============================================================================
-\section{Ongoing Experiments: Gated Forgetting Recurrence (GFR)}
-\label{sec:gfr}
-
-We introduce a simplified recurrent architecture---the \textbf{Gated Forgetting Recurrence (GFR)}---that replaces APN's $D \times D$ matrix state with $K$ independent scalar memory slots per neuron, using the HGRN chunk kernel for an element-wise gated scan.
-
-\subsection{GFR Layer Architecture}
-
-Each GFR layer maintains $K$ memory slots per neuron (total state: a vector of $D \cdot K$ scalars):
-\begin{equation}
-m_{i,k,t} = \lambda_k \, m_{i,k,t-1} + z_{i,t}, \quad
-h_{i,t} = z_{i,t} + \sum_{k=1}^{K} \eta_k \, m_{i,k,t}
-\end{equation}
-where $\mathbf{z}_t = W \cdot \text{act}(\mathbf{x}_t)$ is the projected input, $\lambda_k \in (0,1)$ is a per-slot decay rate, and $\eta_k$ is a per-slot readout weight.
-The output passes through LayerNorm before the residual connection.
-
-\textbf{Key differences from APN:}
-\begin{itemize}
-\item \textbf{State:} $D \cdot K$ scalars (vector) vs.\ $D \times D$ matrix. At $D=100, K=4$: 400 vs.\ 10,000 elements.
-\item \textbf{Recurrence:} Element-wise multiply-add (trivially parallel) vs.\ rank-1 outer product + delta correction.
-\item \textbf{Kernel:} \texttt{chunk\_hgrn} (simple prefix scan) vs.\ \texttt{chunk\_gated\_delta\_rule} (WY transform + triangular solve).
-\item \textbf{No tiling sensitivity:} HGRN operates on flat vectors, not $D \times D$ tile blocks---no performance cliffs at non-aligned $D$.
-\end{itemize}
-
-\textbf{Parameters per layer:} $D^2$ (projection $W$) $+ 2K$ (scalars $\lambda, \eta$) $+ 2D$ (LayerNorm) $\approx D^2$.
-
-\subsection{Parameter Granularity Options}
-
-The GFR implementation supports multiple granularities for $\lambda$ and $\eta$:
-
-\begin{table}[h]
-\centering
-\caption{GFR parameter granularity options. $D=100$, $K=4$.}
-\label{tab:gfr_granularity}
-\begin{tabular}{llccc}
-\toprule
-\textbf{Mode} & \textbf{CLI Flags} & $\boldsymbol{\lambda}$ \textbf{shape} & $\boldsymbol{\eta}$ \textbf{shape} & \textbf{Extra params/layer} \\
-\midrule
-Per-slot (default) & (none) & $[K]$ & $[K]$ & 8 \\
-Per-neuron-per-slot & \texttt{--gfr-per-neuron-lam/eta} & $[D, K]$ & $[D, K]$ & 800 \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-In per-slot mode, all $D$ neurons within a slot share the same $\lambda_k$ and $\eta_k$.
-In per-neuron mode, each of the $D \cdot K = 400$ scalar memories has its own learned decay and readout weight, initialized from the per-slot defaults but free to diverge during training.
-The HGRN chunk kernel is agnostic to this distinction---it processes a flat $D \cdot K$ vector regardless.
-
-\subsection{Speed Comparison with APN}
-
-GFR should be $\approx$1.5--1.7$\times$ faster than APN per epoch at the same $D$:
-\begin{itemize}
-\item Both share the same $D \times D$ linear projection (dominates wall-clock time at $D=100$).
-\item APN's recurrence kernel (\texttt{chunk\_gated\_delta\_rule}) processes a $D \times D$ state matrix with tiled outer products and WY triangular solves; GFR's \texttt{chunk\_hgrn} kernel does a simple element-wise gated scan on $D \cdot K = 400$ elements---effectively free ($< 0.1$\,ms at $T=1024$).
-\item GFR avoids the Triton $\ge$3.4 backward correctness bug (no gated chunk delta rule kernel involved).
-\end{itemize}
-
-\subsection{Planned Experiments}
-
-We submit five GFR experiments to compare against APN at matched parameters:
-
-\begin{table}[h]
-\centering
-\caption{GFR experiments in progress ($L=10$, 200 epochs, 20-epoch warmup, seed 42).}
-\label{tab:gfr_runs}
-\begin{tabular}{llccccc}
-\toprule
-\textbf{Run Name} & \textbf{Config} & \textbf{$D$} & \textbf{$K$} & \textbf{Params} & \textbf{FFN} & \textbf{$\lambda/\eta$ mode} \\
-\midrule
-\multicolumn{7}{l}{\textit{Parameter-matched to APN no-FFN ($\approx$103K)}} \\
-\midrule
-\texttt{gfr\_K1\_D100} & GFR $K=1$ & 100 & 1 & 103,630 & No & Per-slot (scalar) \\
-\texttt{gfr\_K4\_pn\_D100} & GFR $K=4$ & 100 & 4 & 111,610 & No & Per-neuron \\
-\texttt{gfr\_K1\_D34\_ffn\_paramatch} & GFR $K=1$ + FFN & 34 & 1 & 105,974 & Yes & Per-slot (scalar) \\
-\midrule
-\multicolumn{7}{l}{\textit{Parameter-matched to Transformer D=100 ($\approx$1.2M)}} \\
-\midrule
-\texttt{gfr\_K1\_D115\_ffn} & GFR $K=1$ + FFN & 115 & 1 & 1,196,720 & Yes & Per-slot (scalar) \\
-\texttt{gfr\_K4\_pn\_D115\_ffn} & GFR $K=4$ + FFN & 115 & 4 & 1,205,900 & Yes & Per-neuron \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-The \texttt{gfr\_K1\_D34\_ffn\_paramatch} experiment is particularly informative: it tests whether GFR+FFN at $\approx$103K parameters (matching plain GFR $K=1$ $D=100$) suffers the same FFN memorization problem as APN+FFN, or whether the simpler element-wise recurrence avoids it.
-
-\textbf{Default per-slot initialization ($K=4$):}
-\begin{itemize}
-\item Slot 0: $\lambda=0.999$, $\eta=1.0$ \quad (long-term memory)
-\item Slot 1: $\lambda=0.99$, $\eta=1.0$ \quad (medium-term)
-\item Slot 2: $\lambda=0.9$, $\eta=1.0$ \quad (short-term)
-\item Slot 3: $\lambda=0.999$, $\eta=0.1$ \quad (slow integrator)
-\end{itemize}
-For $K=1$: $\lambda=0.999$, $\eta=1.0$ (single timescale, matches APN's default).
-
-\textbf{Hypotheses:}
-\begin{enumerate}
-\item GFR $K=1$ should train $\approx$1.5$\times$ faster than APN with comparable or slightly lower accuracy (simpler state cannot do delta-rule correction).
-\item GFR $K=4$ per-neuron may match or exceed APN by compensating the simpler recurrence with richer per-neuron temporal dynamics.
-\item GFR + FFN may avoid APN+FFN's memorization problem: the multi-slot memory provides diverse temporal features that the FFN can productively combine.
-\end{enumerate}
-
-Results will be added once experiments complete.
-
-% ============================================================================
-\section{Planned: Learning Rate Sweep}
-\label{sec:lr_sweep}
-
-All prior experiments used a fixed learning rate of $10^{-3}$. To verify that this choice is near-optimal for each architecture and to rule out confounding effects of LR sensitivity, we plan a systematic sweep across five learning rates for the $\approx$103K parameter-matched group (no FFN):
-
-\begin{table}[h]
-\centering
-\caption{Learning rate sweep design (15 jobs total, W\&B project: \texttt{seq-cifar10-apn-lr-sweep}).}
-\label{tab:lr_sweep}
-\begin{tabular}{lccccc}
-\toprule
-\textbf{Model ($\approx$103K)} & \textbf{1e-4} & \textbf{3e-4} & \textbf{1e-3} & \textbf{3e-3} & \textbf{1e-2} \\
-\midrule
-APN $D=100$ & \checkmark & \checkmark & \checkmark$^\dagger$ & \checkmark & \checkmark \\
-DeltaNet $D=58$ & \checkmark & \checkmark & \checkmark$^\dagger$ & \checkmark & \checkmark \\
-Transformer $D=29$ & \checkmark & \checkmark & \checkmark$^\dagger$ & \checkmark & \checkmark \\
-\bottomrule
-\end{tabular}
-
-\smallskip
-{\footnotesize ${}^\dagger$ Repeats prior best configuration (lr=$10^{-3}$) for consistency check.}
-\end{table}
-
-All runs use 200 epochs, batch size 64, 20-epoch warmup, and cosine annealing. The submission script (\texttt{experiments/beaker/sweep\_lr.sh}) batches jobs to respect the cluster's 4-concurrent-job limit.
-
-\textbf{Key questions:}
-\begin{enumerate}
-\item Is APN's advantage robust across learning rates, or did we happen to pick its optimal LR?
-\item Does DeltaNet's early-peaking behavior change with lower LR (slower convergence but less overfitting)?
-\item Does the Transformer benefit from higher LR given its larger effective batch gradient (softmax attention aggregates all tokens)?
-\end{enumerate}
-
-% ============================================================================
-\section{Summary of Running and Pending Experiments}
-\label{sec:status}
-
-As of April 29, 2026, the following experiments are submitted to Beaker:
-
-\begin{table}[h]
-\centering
-\caption{Current experiment status.}
-\label{tab:status}
-\begin{tabular}{llcc}
-\toprule
-\textbf{Experiment Group} & \textbf{Beaker Name} & \textbf{Jobs} & \textbf{Status} \\
-\midrule
-\multicolumn{4}{l}{\textit{Multi-head ($H=4$) --- submitted earlier}} \\
-\midrule
-Transformer $D=100$ $H=4$ & \texttt{fleet-imp-856264f} & 1 & Running \\
-DeltaNet $D=104$ $H=4$ +FFN & \texttt{needed-koala-3cf6205} & 1 & Running \\
-APN $D=116$ $H=4$ +FFN per-head & \texttt{gentle-cub-7c88e09} & 1 & Running \\
-APN $D=100$ $H=4$ per-head & \texttt{exact-lemur-d9be705} & 1 & Running \\
-\midrule
-\multicolumn{4}{l}{\textit{GFR --- submitted this session}} \\
-\midrule
-GFR $K=1$ $D=100$ no-FFN & \texttt{new-alpaca-cf9b4ad} & 1 & Submitted \\
-GFR $K=1$ $D=115$ +FFN & \texttt{light-wasp-32331b3} & 1 & Submitted \\
-GFR $K=1$ $D=34$ +FFN param-match & \texttt{modest-jennet-ef140f4} & 1 & Submitted \\
-\midrule
-\multicolumn{4}{l}{\textit{LR Sweep --- pending (script ready)}} \\
-\midrule
-APN/DeltaNet/Transformer $\times$ 5 LRs & --- & 15 & Pending \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-\textbf{Still to submit} (blocked by 4-job cluster limit):
-\begin{itemize}
-\item GFR $K=4$ per-neuron $D=100$ no-FFN (\texttt{gfr\_K4\_pn\_D100})
-\item GFR $K=4$ per-neuron $D=115$ +FFN (\texttt{gfr\_K4\_pn\_D115\_ffn})
-\item LR sweep: 15 jobs via \texttt{experiments/beaker/sweep\_lr.sh} (batched, 4 at a time)
-\end{itemize}
-
-% ============================================================================
-\section{Future Work}
-
-Based on these findings, several directions could improve APN's performance:
-
-\begin{enumerate}
-\item \textbf{Separate key and value projections for APN.} The current APN design ties $\mathbf{k}$ and $\mathbf{v}$ through a single projection. Decoupling them (e.g., $\mathbf{k} = W_K \mathbf{x}$, $\mathbf{v} = W_V \mathbf{x}$) would increase per-layer cost to $2D^2$ but may enable the model to benefit from FFN augmentation.
-\item \textbf{Regularization for APN+FFN.} Dropout, weight decay, or stochastic depth may prevent the FFN from memorizing when paired with APN.
-\item \textbf{Multi-head APN.} Splitting $D$ into $H$ heads with $D/H$-dimensional states may improve representation diversity.
-\item \textbf{Activation sweep.} Testing \texttt{sigmoid}, \texttt{softsign}, \texttt{silu}, and \texttt{gelu} activations on APN keys.
-\item \textbf{Longer sequences.} Scaling to $T > 4096$ where the $O(T)$ vs.\ $O(T^2)$ gap dominates and APN/DeltaNet's linear complexity advantage becomes decisive.
-\item \textbf{Language modeling.} Evaluating APN on autoregressive language tasks where the Hebbian memory matrix may better capture associative patterns.
-\end{enumerate}
+The complete failure of multi-head APN reveals a fundamental architectural vulnerability: the learned scalars $\eta$ and $\lambda$ are unconstrained (no sigmoid or clamp), and at small per-head dimensions ($D/H = 25$), the rank-1 Hebbian update dominates the state dynamics.
+When $\eta$ drifts negative (as observed in head~3), the ``correction'' term $\mathbf{v}_t - S_{t-1}^\top \mathbf{k}_t$ reverses sign, creating a positive feedback loop that diverges exponentially.
+Future work should constrain $\eta \ge 0$ (e.g., via softplus) and $\lambda \in (0,1)$ (via sigmoid) to prevent this instability.
 
 % ============================================================================
 \section{Conclusions}
 
 \begin{enumerate}
-\item \textbf{Plain APN is the most parameter-efficient model.} With only 103K parameters, APN (act=none) achieves 58.34\% test accuracy---within 4 points of DeltaNet (62.28\%, 305K params) and 5 points of the Transformer (63.50\%, 1.2M params). Per 1K parameters, APN delivers $3\times$ the accuracy gain of DeltaNet and $11\times$ that of the Transformer.
+\item \textbf{APN is the most parameter-efficient model} (58.3\% at 103K params) but has a hard ceiling due to its tied key-value design.
 
-\item \textbf{APN is uniquely resistant to overfitting.} APN's peak-to-final accuracy drop is only 0.17 points, compared to 4.7 points for DeltaNet $D=58$ and 3.9 points for Transformer $D=29$ at the same parameter budget. APN does not require early stopping.
+\item \textbf{APN is uniquely resistant to overfitting} (0.17-point peak-to-final drop), requiring no early stopping or regularization.
 
-\item \textbf{Adding FFN does not help APN.} APN+FFN (56.84\%, 1.2M params) is \emph{worse} than plain APN (58.34\%, 103K params) by 1.5 points. The FFN enables 100\% training accuracy but this capacity is entirely wasted on memorization. APN's single-projection design acts as an implicit regularizer that cannot leverage additional capacity through naive FFN augmentation.
+\item \textbf{Multi-head APN diverges} due to unconstrained $\eta$ going negative in small per-head dimensions. Constraining $\eta \ge 0$ is essential for multi-head deployment.
 
-\item \textbf{DeltaNet+FFN nearly matches the Transformer.} At $\approx$1.2M params, DeltaNet+FFN reaches 62.80\% vs.\ the Transformer's 63.50\%---only 0.7 points behind. Moreover, DeltaNet+FFN is the most stable model in the 1.2M group (0.00-point peak-to-final drop).
+\item \textbf{GFR validates APN's matrix state}: the $D{\times}D$ associative memory provides 2--5 points over scalar exponential decay at equal parameters, confirming genuine associative capacity.
 
-\item \textbf{APN trains $\approx$4$\times$ faster} than DeltaNet and $\approx$1.5$\times$ faster than the Transformer per epoch at $D=100$, using $\approx$2.7$\times$ less GPU memory.
+\item \textbf{GFR+FFN outperforms APN+FFN} (58.9\% vs.\ 56.8\%), showing that simpler recurrences combine better with FFN augmentation.
 
-\item \textbf{The identity activation (\texttt{act=none}) is best for APN}, outperforming \texttt{tanh} by 5--6 points. Warmup helps APN (+0.2 points) but hurts DeltaNet ($-$3 points).
+\item \textbf{DeltaNet+FFN $H{=}4$ (63.6\%) nearly matches Transformer $H{=}4$ (65.2\%)} with linear-time complexity---the practical gap is only 1.6 points.
 
-\item \textbf{The key architectural bottleneck} for APN is its tied key-value representation ($\mathbf{k} = \mathbf{v} = W\mathbf{x}$). Decoupling keys and values---moving from $D^2$ to $2D^2$ parameters per layer---is the most promising direction to close the accuracy gap while preserving APN's speed and memory advantages.
+\item \textbf{Loss--accuracy divergence} is a benign artifact of confident overparameterized models: test loss can reach $\sim$5.0 while accuracy remains stable, because cross-entropy heavily penalizes confident wrong predictions while accuracy only counts correct/incorrect.
+
+\item \textbf{The identity activation (\texttt{act=none}) is best for APN}, outperforming \texttt{tanh} by 5--6 points by preserving the full dynamic range of keys.
+
+\item \textbf{GFR $K{=}1$ is the fastest model} (14 s/epoch, $1.8\times$ faster than APN, $7\times$ faster than DeltaNet) with acceptable accuracy for rapid prototyping.
 \end{enumerate}
+
+\subsection{Future Directions}
+
+\begin{enumerate}
+\item \textbf{Constrained APN scalars}: Apply softplus to $\eta$ and sigmoid to $\lambda$ to enable safe multi-head operation.
+\item \textbf{Separate key/value projections}: Move from $D^2$ to $2D^2$ parameters to decouple the representation bottleneck.
+\item \textbf{Learning rate sweep}: Systematic comparison across LRs to verify robustness of findings.
+\item \textbf{Longer sequences}: $T > 4096$ where linear-time complexity becomes decisive.
+\item \textbf{Language modeling}: Evaluate on autoregressive tasks where associative memory may show greater advantages.
+\end{enumerate}
+
+% ============================================================================
+\clearpage
+\appendix
+\section{Complete Training Curves for All Runs}
+\label{app:all_curves}
+
+This appendix presents test accuracy and test loss curves for all 24 successfully-trained runs (excluding the two NaN-diverged APN $H{=}4$ configurations).
+
+\subsection{Group 1: $\approx$1.2M Parameter Models}
+
+All models in this group reach 100\% training accuracy. The key differentiator is test generalization and the loss--accuracy divergence pattern (Section~\ref{sec:loss_divergence}).
+
+\begin{figure}[h]
+\centering
+\begin{subfigure}[b]{0.48\textwidth}
+\begin{tikzpicture}
+\begin{axis}[
+    width=\textwidth,
+    height=0.75\textwidth,
+    xlabel={Epoch},
+    ylabel={Test Accuracy (\%)},
+    xmin=0, xmax=200,
+    ymin=10, ymax=67,
+    grid=major,
+    grid style={gray!30},
+    legend style={at={(0.98,0.02)}, anchor=south east, font=\tiny, draw=none, fill=white, fill opacity=0.8},
+    every axis plot/.append style={thick},
+]
+\addplot[color=transformer, thick] table[x=epoch, y=test/acc, col sep=comma]
+    {../report_data/transformer_D100_H4.csv};
+\addlegendentry{Transf. H=4 (65.2\%)}
+\addplot[color=transformer-pm, thick, dashed] table[x=epoch, y=test/acc, col sep=comma]
+    {../report_data/transformer_L10_D100_H200_B64_warmup20.csv};
+\addlegendentry{Transf. H=1 (63.5\%)}
+\addplot[color=deltanet-ffn, thick] table[x=epoch, y=test/acc, col sep=comma]
+    {../report_data/deltanet_D104_H4_ffn.csv};
+\addlegendentry{DN+FFN H=4 (63.6\%)}
+\addplot[color=deltanet-pm, thick, dashed] table[x=epoch, y=test/acc, col sep=comma]
+    {../report_data/deltanet_L10_D104_H200_B64_ffn_warmup20_paramatch.csv};
+\addlegendentry{DN+FFN H=1 (62.8\%)}
+\addplot[color=gfr-ffn, thick] table[x=epoch, y=test/acc, col sep=comma]
+    {../report_data/gfr_K1_D115_ffn.csv};
+\addlegendentry{GFR+FFN (58.9\%)}
+\addplot[color=apn-ffn, thick] table[x=epoch, y=test/acc, col sep=comma]
+    {../report_data/apn_L10_D115_H200_B64_ffn_warmup20_paramatch.csv};
+\addlegendentry{APN+FFN (56.8\%)}
+\end{axis}
+\end{tikzpicture}
+\caption{Test accuracy}
+\end{subfigure}
+\hfill
+\begin{subfigure}[b]{0.48\textwidth}
+\begin{tikzpicture}
+\begin{axis}[
+    width=\textwidth,
+    height=0.75\textwidth,
+    xlabel={Epoch},
+    ylabel={Test Loss},
+    xmin=0, xmax=200,
+    ymin=0.5, ymax=6.0,
+    grid=major,
+    grid style={gray!30},
+    legend style={at={(0.02,0.98)}, anchor=north west, font=\tiny, draw=none, fill=white, fill opacity=0.8},
+    every axis plot/.append style={thick},
+]
+\addplot[color=transformer, thick] table[x=epoch, y=test/loss, col sep=comma]
+    {../report_data/transformer_D100_H4.csv};
+\addlegendentry{Transf. H=4}
+\addplot[color=transformer-pm, thick, dashed] table[x=epoch, y=test/loss, col sep=comma]
+    {../report_data/transformer_L10_D100_H200_B64_warmup20.csv};
+\addlegendentry{Transf. H=1}
+\addplot[color=deltanet-ffn, thick] table[x=epoch, y=test/loss, col sep=comma]
+    {../report_data/deltanet_D104_H4_ffn.csv};
+\addlegendentry{DN+FFN H=4}
+\addplot[color=deltanet-pm, thick, dashed] table[x=epoch, y=test/loss, col sep=comma]
+    {../report_data/deltanet_L10_D104_H200_B64_ffn_warmup20_paramatch.csv};
+\addlegendentry{DN+FFN H=1}
+\addplot[color=gfr-ffn, thick] table[x=epoch, y=test/loss, col sep=comma]
+    {../report_data/gfr_K1_D115_ffn.csv};
+\addlegendentry{GFR+FFN}
+\addplot[color=apn-ffn, thick] table[x=epoch, y=test/loss, col sep=comma]
+    {../report_data/apn_L10_D115_H200_B64_ffn_warmup20_paramatch.csv};
+\addlegendentry{APN+FFN}
+\end{axis}
+\end{tikzpicture}
+\caption{Test loss}
+\end{subfigure}
+\caption{$\approx$1.2M parameter group. All models except APN+FFN exhibit strong loss--accuracy divergence after reaching 100\% train accuracy. APN+FFN reaches 100\% train accuracy but shows a milder loss increase, consistent with its lower confidence overall. The Transformer and DeltaNet+FFN both gain from $H{=}4$ multi-head attention.}
+\label{fig:app_1.2M}
+\end{figure}
+
+\subsection{Group 2: $\approx$103K Parameter Models (No FFN)}
+
+Models in this group are capacity-limited and generally do not reach 100\% train accuracy. Overfitting patterns vary dramatically by architecture.
+
+\begin{figure}[h]
+\centering
+\begin{subfigure}[b]{0.48\textwidth}
+\begin{tikzpicture}
+\begin{axis}[
+    width=\textwidth,
+    height=0.75\textwidth,
+    xlabel={Epoch},
+    ylabel={Test Accuracy (\%)},
+    xmin=0, xmax=200,
+    ymin=30, ymax=62,
+    grid=major,
+    grid style={gray!30},
+    legend style={at={(0.98,0.02)}, anchor=south east, font=\tiny, draw=none, fill=white, fill opacity=0.8},
+    every axis plot/.append style={thick},
+]
+\addplot[color=apn-none, thick] table[x=epoch, y=test/acc, col sep=comma]
+    {../report_data/apn_L10_D100_H200_B64_act-none_warmup20.csv};
+\addlegendentry{APN none (58.3\%)}
+\addplot[color=apn-tanh, thick] table[x=epoch, y=test/acc, col sep=comma]
+    {../report_data/apn_L10_D100_H200_B64_act-tanh_better_init_lam_eta.csv};
+\addlegendentry{APN tanh (53.2\%)}
+\addplot[color=deltanet-pm, thick] table[x=epoch, y=test/acc, col sep=comma]
+    {../report_data/deltanet_L10_D58_H200_B64.csv};
+\addlegendentry{DeltaNet D=58 (60.1\%)}
+\addplot[color=transformer-pm, thick] table[x=epoch, y=test/acc, col sep=comma]
+    {../report_data/transformer_L10_D29_H200_B64_warmup20_paramatch.csv};
+\addlegendentry{Transf. D=29 (59.8\%)}
+\addplot[color=gfr-k4, thick] table[x=epoch, y=test/acc, col sep=comma]
+    {../report_data/gfr_K4_D100_perslot.csv};
+\addlegendentry{GFR K=4 (56.0\%)}
+\addplot[color=gfr-k1, thick] table[x=epoch, y=test/acc, col sep=comma]
+    {../report_data/gfr_K1_D100.csv};
+\addlegendentry{GFR K=1 (53.6\%)}
+\end{axis}
+\end{tikzpicture}
+\caption{Test accuracy}
+\end{subfigure}
+\hfill
+\begin{subfigure}[b]{0.48\textwidth}
+\begin{tikzpicture}
+\begin{axis}[
+    width=\textwidth,
+    height=0.75\textwidth,
+    xlabel={Epoch},
+    ylabel={Test Loss},
+    xmin=0, xmax=200,
+    ymin=1.0, ymax=2.5,
+    grid=major,
+    grid style={gray!30},
+    legend style={at={(0.98,0.98)}, anchor=north east, font=\tiny, draw=none, fill=white, fill opacity=0.8},
+    every axis plot/.append style={thick},
+]
+\addplot[color=apn-none, thick] table[x=epoch, y=test/loss, col sep=comma]
+    {../report_data/apn_L10_D100_H200_B64_act-none_warmup20.csv};
+\addlegendentry{APN none}
+\addplot[color=apn-tanh, thick] table[x=epoch, y=test/loss, col sep=comma]
+    {../report_data/apn_L10_D100_H200_B64_act-tanh_better_init_lam_eta.csv};
+\addlegendentry{APN tanh}
+\addplot[color=deltanet-pm, thick] table[x=epoch, y=test/loss, col sep=comma]
+    {../report_data/deltanet_L10_D58_H200_B64.csv};
+\addlegendentry{DeltaNet D=58}
+\addplot[color=transformer-pm, thick] table[x=epoch, y=test/loss, col sep=comma]
+    {../report_data/transformer_L10_D29_H200_B64_warmup20_paramatch.csv};
+\addlegendentry{Transf. D=29}
+\addplot[color=gfr-k4, thick] table[x=epoch, y=test/loss, col sep=comma]
+    {../report_data/gfr_K4_D100_perslot.csv};
+\addlegendentry{GFR K=4}
+\addplot[color=gfr-k1, thick] table[x=epoch, y=test/loss, col sep=comma]
+    {../report_data/gfr_K1_D100.csv};
+\addlegendentry{GFR K=1}
+\end{axis}
+\end{tikzpicture}
+\caption{Test loss}
+\end{subfigure}
+\caption{$\approx$103K parameter group (no FFN). DeltaNet D=58 and Transformer D=29 both peak early and decline significantly (4.7 and 3.9 point drops respectively), despite reaching 100\% train accuracy. APN and GFR models show steady improvement with minimal overfitting, as they cannot fully memorize the training set. Test loss for APN/GFR stabilizes around 1.2--1.3, while DeltaNet/Transformer test loss increases after their peaks.}
+\label{fig:app_103K}
+\end{figure}
+
+\subsection{Group 3: GFR Configurations}
+
+\begin{figure}[h]
+\centering
+\begin{subfigure}[b]{0.48\textwidth}
+\begin{tikzpicture}
+\begin{axis}[
+    width=\textwidth,
+    height=0.75\textwidth,
+    xlabel={Epoch},
+    ylabel={Test Accuracy (\%)},
+    xmin=0, xmax=200,
+    ymin=30, ymax=60,
+    grid=major,
+    grid style={gray!30},
+    legend style={at={(0.98,0.02)}, anchor=south east, font=\tiny, draw=none, fill=white, fill opacity=0.8},
+    every axis plot/.append style={thick},
+]
+\addplot[color=gfr-ffn, thick] table[x=epoch, y=test/acc, col sep=comma]
+    {../report_data/gfr_K1_D115_ffn.csv};
+\addlegendentry{K=1+FFN D=115 (58.9\%)}
+\addplot[color=gfr-k4, thick] table[x=epoch, y=test/acc, col sep=comma]
+    {../report_data/gfr_K4_D100_perslot.csv};
+\addlegendentry{K=4 per-slot (56.0\%)}
+\addplot[color=gfr-k4, thick, dashed] table[x=epoch, y=test/acc, col sep=comma]
+    {../report_data/gfr_K4_D100_perneuron.csv};
+\addlegendentry{K=4 per-neuron (56.2\%)}
+\addplot[color=gfr-k1, thick] table[x=epoch, y=test/acc, col sep=comma]
+    {../report_data/gfr_K1_D100.csv};
+\addlegendentry{K=1 per-slot (53.6\%)}
+\addplot[color=gfr-k1, thick, dashed] table[x=epoch, y=test/acc, col sep=comma]
+    {../report_data/gfr_K1_D100_perneuron.csv};
+\addlegendentry{K=1 per-neuron (52.4\%)}
+\addplot[color=gfr-k1, thick, dotted] table[x=epoch, y=test/acc, col sep=comma]
+    {../report_data/gfr_K1_D34_ffn_paramatch.csv};
+\addlegendentry{K=1+FFN D=34 (57.6\%\textrightarrow 51.9\%)}
+\end{axis}
+\end{tikzpicture}
+\caption{Test accuracy}
+\end{subfigure}
+\hfill
+\begin{subfigure}[b]{0.48\textwidth}
+\begin{tikzpicture}
+\begin{axis}[
+    width=\textwidth,
+    height=0.75\textwidth,
+    xlabel={Epoch},
+    ylabel={Test Loss},
+    xmin=0, xmax=200,
+    ymin=0.5, ymax=5.5,
+    grid=major,
+    grid style={gray!30},
+    legend style={at={(0.02,0.98)}, anchor=north west, font=\tiny, draw=none, fill=white, fill opacity=0.8},
+    every axis plot/.append style={thick},
+]
+\addplot[color=gfr-ffn, thick] table[x=epoch, y=test/loss, col sep=comma]
+    {../report_data/gfr_K1_D115_ffn.csv};
+\addlegendentry{K=1+FFN D=115}
+\addplot[color=gfr-k4, thick] table[x=epoch, y=test/loss, col sep=comma]
+    {../report_data/gfr_K4_D100_perslot.csv};
+\addlegendentry{K=4 per-slot}
+\addplot[color=gfr-k1, thick] table[x=epoch, y=test/loss, col sep=comma]
+    {../report_data/gfr_K1_D100.csv};
+\addlegendentry{K=1 per-slot}
+\addplot[color=gfr-k1, thick, dotted] table[x=epoch, y=test/loss, col sep=comma]
+    {../report_data/gfr_K1_D34_ffn_paramatch.csv};
+\addlegendentry{K=1+FFN D=34}
+\end{axis}
+\end{tikzpicture}
+\caption{Test loss}
+\end{subfigure}
+\caption{All GFR configurations. Key observations: (1) $K{=}4$ gains $\approx$2.4 points over $K{=}1$. (2) Per-neuron and per-slot perform similarly for $K{=}4$, but per-neuron is \emph{worse} for $K{=}1$. (3) GFR $K{=}1$+FFN at $D{=}34$ (103K params) peaks at 57.6\% (epoch 39) but overfits dramatically to 51.9\%---the FFN memorizes with the small-D recurrence. (4) GFR $K{=}1$+FFN at $D{=}115$ (1.2M) shows the loss--accuracy divergence pattern (test loss $\to$ 5.3, acc stable at 58.9\%).}
+\label{fig:app_gfr}
+\end{figure}
+
+\subsection{Group 4: Width-Matched DeltaNet ($D{=}100$)}
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+    width=0.7\textwidth,
+    height=0.45\textwidth,
+    xlabel={Epoch},
+    ylabel={Test Accuracy (\%)},
+    xmin=0, xmax=200,
+    ymin=35, ymax=64,
+    grid=major,
+    grid style={gray!30},
+    legend style={at={(0.98,0.02)}, anchor=south east, font=\footnotesize, draw=none, fill=white, fill opacity=0.8},
+    every axis plot/.append style={thick},
+]
+\addplot[color=deltanet, thick] table[x=epoch, y=test/acc, col sep=comma]
+    {../report_data/deltanet_L10_D100_H200_B64.csv};
+\addlegendentry{DeltaNet D=100 no warmup (62.3\%)}
+\addplot[color=deltanet-pm, thick, dashed] table[x=epoch, y=test/acc, col sep=comma]
+    {../report_data/deltanet_L10_D100_H200_B64_warmup20.csv};
+\addlegendentry{DeltaNet D=100 warmup20 (59.3\%)}
+\addplot[color=apn-none, thick] table[x=epoch, y=test/acc, col sep=comma]
+    {../report_data/apn_L10_D100_H200_B64_act-none_warmup20.csv};
+\addlegendentry{APN D=100 (58.3\%, 3$\times$ fewer params)}
+\end{axis}
+\end{tikzpicture}
+\caption{Width-matched comparison at $D{=}100$. DeltaNet (305K params) peaks at 62.3\% (epoch 11) but declines to 60.8\%. Warmup \emph{hurts} DeltaNet by 3 points. APN (103K params, $3\times$ fewer) achieves 58.3\% with steady convergence and no overfitting.}
+\label{fig:app_width}
+\end{figure}
+
+\subsection{Run Configuration Details}
+
+\begin{table}[h]
+\centering
+\caption{Complete configuration details for all 26 runs. All use $L{=}10$ layers, batch size 64, AdamW with lr=$10^{-3}$, cosine schedule.}
+\label{tab:app_configs}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{llcccccl}
+\toprule
+\textbf{Run Name} & \textbf{Model} & \textbf{$D$} & \textbf{$H$} & \textbf{FFN} & \textbf{Params} & \textbf{Warmup} & \textbf{Notes} \\
+\midrule
+\texttt{transformer\_D100\_H4} & Transformer & 100 & 4 & Yes & 1,205,610 & 20 & Best overall (65.2\%) \\
+\texttt{transformer\_L10\_D100\_\ldots\_warmup20} & Transformer & 100 & 1 & Yes & 1,205,610 & 20 & H=1 baseline \\
+\texttt{transformer\_L10\_D29\_\ldots\_paramatch} & Transformer & 29 & 1 & Yes & 102,554 & 20 & Param-matched \\
+\texttt{deltanet\_D104\_H4\_ffn} & DeltaNet+FFN & 104 & 4 & Yes & 1,199,754 & 20 & Multi-head DeltaNet \\
+\texttt{deltanet\_L10\_D104\_\ldots\_paramatch} & DeltaNet+FFN & 104 & 1 & Yes & 1,196,634 & 20 & 1.2M param-match \\
+\texttt{deltanet\_L10\_D100\_\ldots} & DeltaNet & 100 & 1 & No & 304,610 & 0 & Width-matched \\
+\texttt{deltanet\_L10\_D100\_\ldots\_warmup20} & DeltaNet & 100 & 1 & No & 304,610 & 20 & Warmup hurts \\
+\texttt{deltanet\_L10\_D58\_\ldots} & DeltaNet & 58 & 1 & No & 103,598 & 0 & Param-matched \\
+\texttt{apn\_L10\_D100\_\ldots\_act-none\_warmup20} & APN & 100 & 1 & No & 103,630 & 20 & Best APN (58.3\%) \\
+\texttt{apn\_L10\_D100\_\ldots\_act-none} & APN & 100 & 1 & No & 103,630 & 0 & No warmup (58.1\%) \\
+\texttt{apn\_L10\_D115\_\ldots\_ffn\_\ldots\_paramatch} & APN+FFN & 115 & 1 & Yes & 1,196,720 & 20 & FFN hurts (56.8\%) \\
+\texttt{apn\_D116\_H4\_ffn\_perhead} & APN+FFN & 116 & 4 & Yes & 1,217,626 & 20 & NaN at epoch 10 \\
+\texttt{apn\_D100\_H4\_perhead} & APN & 100 & 4 & No & 103,690 & 20 & NaN from epoch 1 \\
+\texttt{apn\_L10\_D100\_\ldots\_act-tanh\_better\_init} & APN & 100 & 1 & No & 103,630 & 0 & $\lambda{=}0.999,\eta{=}1.0$ \\
+\texttt{apn\_L10\_D100\_\ldots\_act-tanh} & APN & 100 & 1 & No & 103,630 & 0 & Default init \\
+\texttt{apn\_freeze-lam\_\ldots} & APN & 100 & 1 & No & 103,630 & 0 & Frozen $\lambda$ \\
+\texttt{apn\_L10\_D173\_\ldots\_act-tanh} & APN & 173 & 1 & No & 305,548 & 0 & Tile-inefficient \\
+\texttt{apn\_L10\_D100\_H200\_B1024} & APN & 100 & 1 & No & 103,630 & 0 & Large batch (800ep) \\
+\texttt{gfr\_K1\_D100} & GFR $K{=}1$ & 100 & 1 & No & 103,630 & 20 & Simplest GFR \\
+\texttt{gfr\_K1\_D100\_perneuron} & GFR $K{=}1$ & 100 & 1 & No & 105,610 & 20 & Per-neuron $\lambda/\eta$ \\
+\texttt{gfr\_K4\_D100\_perslot} & GFR $K{=}4$ & 100 & 1 & No & 103,690 & 20 & 4 timescales \\
+\texttt{gfr\_K4\_D100\_perneuron} & GFR $K{=}4$ & 100 & 1 & No & 111,610 & 20 & Per-neuron (4 slots) \\
+\texttt{gfr\_K1\_D115\_ffn} & GFR+FFN & 115 & 1 & Yes & 1,196,720 & 20 & 1.2M param-match \\
+\texttt{gfr\_K1\_D34\_ffn\_paramatch} & GFR+FFN & 34 & 1 & Yes & 105,974 & 20 & 103K param-match \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
 
 \end{document}
