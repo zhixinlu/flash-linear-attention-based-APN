@@ -197,6 +197,124 @@ class APNLayer(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# APAN Layer (Original Hebbian APN — stable with normalized keys)
+# ---------------------------------------------------------------------------
+
+class APANLayer(nn.Module):
+    """
+    Original APAN (Associative Plasticity with Attractor Networks) layer.
+
+    Uses pure Hebbian update where the learning signal is the full output:
+        S_t = lam * S_{t-1} + beta * k_t ⊗ (v_t + S_{t-1}^T k_t)
+
+    This is mapped onto the delta-rule kernel by passing negated v and beta:
+        kernel computes: S_t = g*S_{t-1} + (-beta)*k ⊗ ((-v) - S^T k)
+                             = g*S_{t-1} + beta*k ⊗ (v + S^T k)
+
+    Stability condition: lambda + eta*(1-lambda)*||k||^2/d < 1
+    With key normalization:
+        - 'rmsnorm': ||k||^2 = d  →  requires eta < 1 (tanh gives (-1,1))
+        - 'l2norm':  ||k||^2 = 1  →  requires eta < d  (very loose)
+        - 'tanh':    ||k||^2 <= d →  requires eta < 1 (tanh gives (-1,1))
+        - 'none':    ||k||^2 unbounded → unstable in general
+
+    eta is parameterized via tanh: eta = tanh(eta_raw) ∈ (-1, 1).
+    This allows both Hebbian (eta > 0) and anti-Hebbian (eta < 0) learning
+    while guaranteeing stability with any key normalization that bounds ||k||^2 <= d.
+
+    Output: o_t = v_t + S_t^T k_t = (W + S_t)^T k_t
+    """
+
+    def __init__(self, d_hidden: int, n_heads: int = 1, lam=0.99, eta=0.5,
+                 freeze_lam: bool = False, freeze_eta: bool = False,
+                 activation: str = 'none', key_norm: str = 'rmsnorm'):
+        super().__init__()
+        assert d_hidden % n_heads == 0, f"d_hidden={d_hidden} not divisible by n_heads={n_heads}"
+        self.d = d_hidden
+        self.n_heads = n_heads
+        self.head_dim = d_hidden // n_heads
+        self.act_fn = get_activation(activation)
+        self.key_norm = key_norm
+        # Key normalization layer (applied per head)
+        if key_norm == 'rmsnorm':
+            self.k_norm = nn.RMSNorm(self.head_dim)
+        elif key_norm == 'layernorm':
+            self.k_norm = nn.LayerNorm(self.head_dim)
+        elif key_norm in ('l2norm', 'tanh', 'none'):
+            self.k_norm = None
+        else:
+            raise ValueError(f"Unknown key_norm: {key_norm}. Use 'rmsnorm', 'layernorm', 'l2norm', 'tanh', or 'none'.")
+        # eta in (-1, 1) via tanh parameterization
+        if isinstance(eta, (list, tuple)):
+            assert len(eta) == n_heads, f"len(eta)={len(eta)} != n_heads={n_heads}"
+            eta_t = torch.tensor([float(e) for e in eta])
+        else:
+            eta_t = torch.full((n_heads,), float(eta))
+        # Store as atanh(eta) so tanh(eta_raw) = eta ∈ (-1, 1)
+        self.eta_raw = nn.Parameter(eta_t.clip(-0.999, 0.999).atanh())
+        self.eta_raw.requires_grad_(not freeze_eta)
+        # lam in (0,1) via sigmoid
+        if isinstance(lam, (list, tuple)):
+            assert len(lam) == n_heads, f"len(lam)={len(lam)} != n_heads={n_heads}"
+            lam_t = torch.tensor([float(l) for l in lam])
+        else:
+            lam_t = torch.full((n_heads,), float(lam))
+        self.lam_logit = nn.Parameter(lam_t.logit())
+        self.lam_logit.requires_grad_(not freeze_lam)
+        self.W = nn.Linear(d_hidden, d_hidden, bias=False)
+        self.o_norm = nn.LayerNorm(d_hidden)
+
+    @property
+    def lam(self):
+        return self.lam_logit.sigmoid()
+
+    @property
+    def eta(self):
+        return self.eta_raw.tanh()
+
+    def _normalize_keys(self, k):
+        """Apply key normalization. k shape: [B, L, H, d]"""
+        if self.key_norm == 'l2norm':
+            return F.normalize(k, p=2, dim=-1)
+        elif self.key_norm == 'tanh':
+            return k.tanh()
+        elif self.key_norm == 'none':
+            return k
+        else:
+            # rmsnorm or layernorm (self.k_norm is nn.Module)
+            return self.k_norm(k)
+
+    def forward(self, x):
+        """x: [B, L, D] -> [B, L, D]"""
+        B, L, D = x.shape
+        H = self.n_heads
+        d = self.head_dim
+        lam = self.lam                                            # [H]
+        eta = self.eta                                            # [H]
+
+        x_act = self.act_fn(x)                                    # [B, L, D]
+        static_out = self.W(x_act)                                # [B, L, D]
+
+        # Kernel inputs [B, L, H, d]
+        k = self._normalize_keys(x_act.reshape(B, L, H, d))
+        q = k  # tied q = k
+        # Negate v and beta to convert Hebbian update into delta-rule kernel
+        v_neg = -static_out.reshape(B, L, H, d)
+
+        g = lam.log().view(1, 1, H).expand(B, L, H)              # [B, L, H]
+        beta_neg = -(eta * (1 - lam) / d).view(1, 1, H).expand(B, L, H)  # [B, L, H]
+
+        o_dyn, _ = chunk_gated_delta_rule(
+            q=q, k=k, v=v_neg, g=g, beta=beta_neg,
+            scale=1.0,
+            use_qk_l2norm_in_kernel=False,
+        )
+
+        # Output: v + S^T k  (kernel returns S^T k with the APAN-updated S)
+        return self.o_norm(static_out + o_dyn.reshape(B, L, D))
+
+
+# ---------------------------------------------------------------------------
 # GFR Layer (Generalized Firing Rate)
 # ---------------------------------------------------------------------------
 
@@ -401,7 +519,7 @@ class SeqModel(nn.Module):
                  layer_type: str = 'deltanet',
                  apn_lam=0.99, apn_eta=0.01,
                  freeze_lam: bool = False, freeze_eta: bool = False,
-                 apn_activation: str = 'tanh', **kwargs):
+                 apn_activation: str = 'tanh', apn_key_norm: str = 'rmsnorm', **kwargs):
         super().__init__()
         n_heads = kwargs.get('n_heads', 1)
         # per_head_lam / per_head_eta: list of H floats (overrides apn_lam/eta for all layers)
@@ -432,6 +550,15 @@ class SeqModel(nn.Module):
                                             lam=layer_lam, eta=layer_eta,
                                             freeze_lam=freeze_lam, freeze_eta=freeze_eta,
                                             activation=apn_activation))
+            elif layer_type == 'apan':
+                # Original APAN: Hebbian on full output, eta via tanh ∈ (-1,1)
+                layer_lam = per_head_lam if per_head_lam is not None else apn_lam[i]
+                layer_eta = per_head_eta if per_head_eta is not None else apn_eta[i]
+                self.layers.append(APANLayer(d_hidden, n_heads=n_heads,
+                                             lam=layer_lam, eta=layer_eta,
+                                             freeze_lam=freeze_lam, freeze_eta=freeze_eta,
+                                             activation=apn_activation,
+                                             key_norm=apn_key_norm))
             elif layer_type == 'gfr':
                 self.layers.append(GFRLayer(d_hidden, n_slots=gfr_n_slots,
                                             lam=gfr_per_slot_lam, eta=gfr_per_slot_eta,
@@ -536,7 +663,7 @@ def evaluate(model, loader, device):
 def main():
     parser = argparse.ArgumentParser(description="Seq-CIFAR-10: DeltaNet vs APN vs Transformer")
     parser.add_argument('--model', type=str, default='both',
-                        choices=['deltanet', 'apn', 'gfr', 'transformer', 'both'])
+                        choices=['deltanet', 'apn', 'apan', 'gfr', 'transformer', 'both'])
     parser.add_argument('--d-hidden', type=int, default=100)
     parser.add_argument('--n-layers', type=int, default=10)
     parser.add_argument('--apn-lam', type=str, default='0.99',
@@ -548,6 +675,10 @@ def main():
     parser.add_argument('--apn-activation', type=str, default='tanh',
                         choices=list(_ACTIVATIONS.keys()),
                         help='Activation function for APN keys/queries (default: tanh)')
+    parser.add_argument('--apn-key-norm', type=str, default='rmsnorm',
+                        choices=['rmsnorm', 'layernorm', 'l2norm', 'tanh', 'none'],
+                        help='Key normalization for APAN layer (default: rmsnorm). '
+                             'Ensures ||k||^2 is bounded for stability with negative eta.')
     parser.add_argument('--n-heads', type=int, default=1,
                         help='Number of attention heads for transformer/APN (d_hidden must be divisible)')
     parser.add_argument('--apn-per-head-lam', type=str, default=None,
@@ -648,6 +779,8 @@ def main():
         models_to_run.append('deltanet')
     if args.model in ('apn', 'both'):
         models_to_run.append('apn')
+    if args.model == 'apan':
+        models_to_run.append('apan')
     if args.model == 'gfr':
         models_to_run.append('gfr')
     if args.model == 'transformer':
@@ -661,7 +794,8 @@ def main():
             d_input=3, d_hidden=args.d_hidden, n_layers=args.n_layers, n_classes=10,
             layer_type=model_name, apn_lam=args.apn_lam_list, apn_eta=args.apn_eta_list,
             freeze_lam=args.freeze_lam, freeze_eta=args.freeze_eta,
-            apn_activation=args.apn_activation, n_heads=args.n_heads,
+            apn_activation=args.apn_activation, apn_key_norm=args.apn_key_norm,
+            n_heads=args.n_heads,
             use_ffn=args.use_ffn, ffn_mult=args.ffn_mult,
             per_head_lam=args.per_head_lam, per_head_eta=args.per_head_eta,
             gfr_n_slots=args.gfr_n_slots,
@@ -696,6 +830,12 @@ def main():
                 wandb_config.update(apn_lam=args.apn_lam_list, apn_eta=args.apn_eta_list,
                                     freeze_lam=args.freeze_lam, freeze_eta=args.freeze_eta,
                                     apn_activation=args.apn_activation,
+                                    per_head_lam=args.per_head_lam, per_head_eta=args.per_head_eta)
+            if model_name == 'apan':
+                wandb_config.update(apn_lam=args.apn_lam_list, apn_eta=args.apn_eta_list,
+                                    freeze_lam=args.freeze_lam, freeze_eta=args.freeze_eta,
+                                    apn_activation=args.apn_activation,
+                                    apn_key_norm=args.apn_key_norm,
                                     per_head_lam=args.per_head_lam, per_head_eta=args.per_head_eta)
             if model_name == 'gfr':
                 wandb_config.update(gfr_n_slots=args.gfr_n_slots,
@@ -760,6 +900,11 @@ def main():
                         for h in range(layer.n_heads):
                             log_dict[f'apn/eta_layer{i}_head{h}'] = layer.eta[h].item()
                             log_dict[f'apn/lam_layer{i}_head{h}'] = layer.lam[h].item()
+                if model_name == 'apan':
+                    for i, layer in enumerate(model.layers):
+                        for h in range(layer.n_heads):
+                            log_dict[f'apan/eta_layer{i}_head{h}'] = layer.eta[h].item()
+                            log_dict[f'apan/lam_layer{i}_head{h}'] = layer.lam[h].item()
                 if model_name == 'gfr':
                     for i, layer in enumerate(model.layers):
                         for k in range(layer.n_slots):
