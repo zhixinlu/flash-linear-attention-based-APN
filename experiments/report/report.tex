@@ -379,15 +379,15 @@ APN & act=none, warmup20 & 100 & 1 & 103,630 & 58.34 & 189 & 58.17 & 0.17 & 25.5
 With only 105K parameters, APAN (RMSNorm) achieves \textbf{64.22\%} test accuracy---the highest among all $\sim$103K-parameter models, and competitive with the Transformer at 1.2M parameters (65.2\%).
 Per 1K parameters, APAN extracts 0.61\% accuracy, versus 0.56\% for the prediction-error APN, 0.58\% for DeltaNet, and only 0.053\% for the Transformer.
 
-\begin{figure}[h]
+\begin{figure}[p]
 \centering
 \begin{tikzpicture}
 \begin{axis}[
     xbar,
-    width=0.9\textwidth,
-    height=0.6\textwidth,
+    width=0.88\textwidth,
+    height=0.95\textheight,
     xlabel={Peak Test Accuracy (\%)},
-    xmin=40, xmax=67,
+    xmin=48, xmax=68,
     ytick=data,
     yticklabels={
         {APAN RMSNorm (105K)},
@@ -407,14 +407,14 @@ Per 1K parameters, APAN extracts 0.61\% accuracy, versus 0.56\% for the predicti
         {GFR K=4 (104K)},
         {GFR K=1 (104K)}
     },
-    y tick label style={font=\scriptsize},
-    bar width=8pt,
+    y tick label style={font=\small},
+    bar width=12pt,
     grid=major,
     grid style={gray!30, dashed},
     title={\textbf{Summary: Peak Test Accuracy (All Models)}},
-    title style={font=\normalsize},
+    title style={font=\large},
     nodes near coords,
-    nodes near coords style={font=\tiny, anchor=west},
+    nodes near coords style={font=\small, anchor=west},
     every axis plot/.append style={fill opacity=0.85},
 ]
 \addplot[fill=apan-rmsnorm] coordinates {(64.22,16)};
