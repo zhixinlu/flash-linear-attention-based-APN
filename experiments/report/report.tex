@@ -767,7 +767,7 @@ GFR should be $\approx$1.5--1.7$\times$ faster than APN per epoch at the same $D
 
 \subsection{Planned Experiments}
 
-We submit four GFR experiments to compare against APN at matched parameters:
+We submit five GFR experiments to compare against APN at matched parameters:
 
 \begin{table}[h]
 \centering
@@ -777,13 +777,21 @@ We submit four GFR experiments to compare against APN at matched parameters:
 \toprule
 \textbf{Run Name} & \textbf{Config} & \textbf{$D$} & \textbf{$K$} & \textbf{Params} & \textbf{FFN} & \textbf{$\lambda/\eta$ mode} \\
 \midrule
+\multicolumn{7}{l}{\textit{Parameter-matched to APN no-FFN ($\approx$103K)}} \\
+\midrule
 \texttt{gfr\_K1\_D100} & GFR $K=1$ & 100 & 1 & 103,630 & No & Per-slot (scalar) \\
 \texttt{gfr\_K4\_pn\_D100} & GFR $K=4$ & 100 & 4 & 111,610 & No & Per-neuron \\
+\texttt{gfr\_K1\_D34\_ffn\_paramatch} & GFR $K=1$ + FFN & 34 & 1 & 105,974 & Yes & Per-slot (scalar) \\
+\midrule
+\multicolumn{7}{l}{\textit{Parameter-matched to Transformer D=100 ($\approx$1.2M)}} \\
+\midrule
 \texttt{gfr\_K1\_D115\_ffn} & GFR $K=1$ + FFN & 115 & 1 & 1,196,720 & Yes & Per-slot (scalar) \\
 \texttt{gfr\_K4\_pn\_D115\_ffn} & GFR $K=4$ + FFN & 115 & 4 & 1,205,900 & Yes & Per-neuron \\
 \bottomrule
 \end{tabular}
 \end{table}
+
+The \texttt{gfr\_K1\_D34\_ffn\_paramatch} experiment is particularly informative: it tests whether GFR+FFN at $\approx$103K parameters (matching plain GFR $K=1$ $D=100$) suffers the same FFN memorization problem as APN+FFN, or whether the simpler element-wise recurrence avoids it.
 
 \textbf{Default per-slot initialization ($K=4$):}
 \begin{itemize}
@@ -802,6 +810,80 @@ For $K=1$: $\lambda=0.999$, $\eta=1.0$ (single timescale, matches APN's default)
 \end{enumerate}
 
 Results will be added once experiments complete.
+
+% ============================================================================
+\section{Planned: Learning Rate Sweep}
+\label{sec:lr_sweep}
+
+All prior experiments used a fixed learning rate of $10^{-3}$. To verify that this choice is near-optimal for each architecture and to rule out confounding effects of LR sensitivity, we plan a systematic sweep across five learning rates for the $\approx$103K parameter-matched group (no FFN):
+
+\begin{table}[h]
+\centering
+\caption{Learning rate sweep design (15 jobs total, W\&B project: \texttt{seq-cifar10-apn-lr-sweep}).}
+\label{tab:lr_sweep}
+\begin{tabular}{lccccc}
+\toprule
+\textbf{Model ($\approx$103K)} & \textbf{1e-4} & \textbf{3e-4} & \textbf{1e-3} & \textbf{3e-3} & \textbf{1e-2} \\
+\midrule
+APN $D=100$ & \checkmark & \checkmark & \checkmark$^\dagger$ & \checkmark & \checkmark \\
+DeltaNet $D=58$ & \checkmark & \checkmark & \checkmark$^\dagger$ & \checkmark & \checkmark \\
+Transformer $D=29$ & \checkmark & \checkmark & \checkmark$^\dagger$ & \checkmark & \checkmark \\
+\bottomrule
+\end{tabular}
+
+\smallskip
+{\footnotesize ${}^\dagger$ Repeats prior best configuration (lr=$10^{-3}$) for consistency check.}
+\end{table}
+
+All runs use 200 epochs, batch size 64, 20-epoch warmup, and cosine annealing. The submission script (\texttt{experiments/beaker/sweep\_lr.sh}) batches jobs to respect the cluster's 4-concurrent-job limit.
+
+\textbf{Key questions:}
+\begin{enumerate}
+\item Is APN's advantage robust across learning rates, or did we happen to pick its optimal LR?
+\item Does DeltaNet's early-peaking behavior change with lower LR (slower convergence but less overfitting)?
+\item Does the Transformer benefit from higher LR given its larger effective batch gradient (softmax attention aggregates all tokens)?
+\end{enumerate}
+
+% ============================================================================
+\section{Summary of Running and Pending Experiments}
+\label{sec:status}
+
+As of April 29, 2026, the following experiments are submitted to Beaker:
+
+\begin{table}[h]
+\centering
+\caption{Current experiment status.}
+\label{tab:status}
+\begin{tabular}{llcc}
+\toprule
+\textbf{Experiment Group} & \textbf{Beaker Name} & \textbf{Jobs} & \textbf{Status} \\
+\midrule
+\multicolumn{4}{l}{\textit{Multi-head ($H=4$) --- submitted earlier}} \\
+\midrule
+Transformer $D=100$ $H=4$ & \texttt{fleet-imp-856264f} & 1 & Running \\
+DeltaNet $D=104$ $H=4$ +FFN & \texttt{needed-koala-3cf6205} & 1 & Running \\
+APN $D=116$ $H=4$ +FFN per-head & \texttt{gentle-cub-7c88e09} & 1 & Running \\
+APN $D=100$ $H=4$ per-head & \texttt{exact-lemur-d9be705} & 1 & Running \\
+\midrule
+\multicolumn{4}{l}{\textit{GFR --- submitted this session}} \\
+\midrule
+GFR $K=1$ $D=100$ no-FFN & \texttt{new-alpaca-cf9b4ad} & 1 & Submitted \\
+GFR $K=1$ $D=115$ +FFN & \texttt{light-wasp-32331b3} & 1 & Submitted \\
+GFR $K=1$ $D=34$ +FFN param-match & \texttt{modest-jennet-ef140f4} & 1 & Submitted \\
+\midrule
+\multicolumn{4}{l}{\textit{LR Sweep --- pending (script ready)}} \\
+\midrule
+APN/DeltaNet/Transformer $\times$ 5 LRs & --- & 15 & Pending \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Still to submit} (blocked by 4-job cluster limit):
+\begin{itemize}
+\item GFR $K=4$ per-neuron $D=100$ no-FFN (\texttt{gfr\_K4\_pn\_D100})
+\item GFR $K=4$ per-neuron $D=115$ +FFN (\texttt{gfr\_K4\_pn\_D115\_ffn})
+\item LR sweep: 15 jobs via \texttt{experiments/beaker/sweep\_lr.sh} (batched, 4 at a time)
+\end{itemize}
 
 % ============================================================================
 \section{Future Work}
