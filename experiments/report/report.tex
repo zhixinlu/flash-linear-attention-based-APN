@@ -709,6 +709,101 @@ Both $\lambda$ and $\eta$ are now per-head vectors (dimension $[H]$) rather than
 Results will be added to this section once the experiments complete.
 
 % ============================================================================
+\section{Ongoing Experiments: Gated Forgetting Recurrence (GFR)}
+\label{sec:gfr}
+
+We introduce a simplified recurrent architecture---the \textbf{Gated Forgetting Recurrence (GFR)}---that replaces APN's $D \times D$ matrix state with $K$ independent scalar memory slots per neuron, using the HGRN chunk kernel for an element-wise gated scan.
+
+\subsection{GFR Layer Architecture}
+
+Each GFR layer maintains $K$ memory slots per neuron (total state: a vector of $D \cdot K$ scalars):
+\begin{equation}
+m_{i,k,t} = \lambda_k \, m_{i,k,t-1} + z_{i,t}, \quad
+h_{i,t} = z_{i,t} + \sum_{k=1}^{K} \eta_k \, m_{i,k,t}
+\end{equation}
+where $\mathbf{z}_t = W \cdot \text{act}(\mathbf{x}_t)$ is the projected input, $\lambda_k \in (0,1)$ is a per-slot decay rate, and $\eta_k$ is a per-slot readout weight.
+The output passes through LayerNorm before the residual connection.
+
+\textbf{Key differences from APN:}
+\begin{itemize}
+\item \textbf{State:} $D \cdot K$ scalars (vector) vs.\ $D \times D$ matrix. At $D=100, K=4$: 400 vs.\ 10,000 elements.
+\item \textbf{Recurrence:} Element-wise multiply-add (trivially parallel) vs.\ rank-1 outer product + delta correction.
+\item \textbf{Kernel:} \texttt{chunk\_hgrn} (simple prefix scan) vs.\ \texttt{chunk\_gated\_delta\_rule} (WY transform + triangular solve).
+\item \textbf{No tiling sensitivity:} HGRN operates on flat vectors, not $D \times D$ tile blocks---no performance cliffs at non-aligned $D$.
+\end{itemize}
+
+\textbf{Parameters per layer:} $D^2$ (projection $W$) $+ 2K$ (scalars $\lambda, \eta$) $+ 2D$ (LayerNorm) $\approx D^2$.
+
+\subsection{Parameter Granularity Options}
+
+The GFR implementation supports multiple granularities for $\lambda$ and $\eta$:
+
+\begin{table}[h]
+\centering
+\caption{GFR parameter granularity options. $D=100$, $K=4$.}
+\label{tab:gfr_granularity}
+\begin{tabular}{llccc}
+\toprule
+\textbf{Mode} & \textbf{CLI Flags} & $\boldsymbol{\lambda}$ \textbf{shape} & $\boldsymbol{\eta}$ \textbf{shape} & \textbf{Extra params/layer} \\
+\midrule
+Per-slot (default) & (none) & $[K]$ & $[K]$ & 8 \\
+Per-neuron-per-slot & \texttt{--gfr-per-neuron-lam/eta} & $[D, K]$ & $[D, K]$ & 800 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+In per-slot mode, all $D$ neurons within a slot share the same $\lambda_k$ and $\eta_k$.
+In per-neuron mode, each of the $D \cdot K = 400$ scalar memories has its own learned decay and readout weight, initialized from the per-slot defaults but free to diverge during training.
+The HGRN chunk kernel is agnostic to this distinction---it processes a flat $D \cdot K$ vector regardless.
+
+\subsection{Speed Comparison with APN}
+
+GFR should be $\approx$1.5--1.7$\times$ faster than APN per epoch at the same $D$:
+\begin{itemize}
+\item Both share the same $D \times D$ linear projection (dominates wall-clock time at $D=100$).
+\item APN's recurrence kernel (\texttt{chunk\_gated\_delta\_rule}) processes a $D \times D$ state matrix with tiled outer products and WY triangular solves; GFR's \texttt{chunk\_hgrn} kernel does a simple element-wise gated scan on $D \cdot K = 400$ elements---effectively free ($< 0.1$\,ms at $T=1024$).
+\item GFR avoids the Triton $\ge$3.4 backward correctness bug (no gated chunk delta rule kernel involved).
+\end{itemize}
+
+\subsection{Planned Experiments}
+
+We submit four GFR experiments to compare against APN at matched parameters:
+
+\begin{table}[h]
+\centering
+\caption{GFR experiments in progress ($L=10$, 200 epochs, 20-epoch warmup, seed 42).}
+\label{tab:gfr_runs}
+\begin{tabular}{llccccc}
+\toprule
+\textbf{Run Name} & \textbf{Config} & \textbf{$D$} & \textbf{$K$} & \textbf{Params} & \textbf{FFN} & \textbf{$\lambda/\eta$ mode} \\
+\midrule
+\texttt{gfr\_K1\_D100} & GFR $K=1$ & 100 & 1 & 103,630 & No & Per-slot (scalar) \\
+\texttt{gfr\_K4\_pn\_D100} & GFR $K=4$ & 100 & 4 & 111,610 & No & Per-neuron \\
+\texttt{gfr\_K1\_D115\_ffn} & GFR $K=1$ + FFN & 115 & 1 & 1,196,720 & Yes & Per-slot (scalar) \\
+\texttt{gfr\_K4\_pn\_D115\_ffn} & GFR $K=4$ + FFN & 115 & 4 & 1,205,900 & Yes & Per-neuron \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Default per-slot initialization ($K=4$):}
+\begin{itemize}
+\item Slot 0: $\lambda=0.999$, $\eta=1.0$ \quad (long-term memory)
+\item Slot 1: $\lambda=0.99$, $\eta=1.0$ \quad (medium-term)
+\item Slot 2: $\lambda=0.9$, $\eta=1.0$ \quad (short-term)
+\item Slot 3: $\lambda=0.999$, $\eta=0.1$ \quad (slow integrator)
+\end{itemize}
+For $K=1$: $\lambda=0.999$, $\eta=1.0$ (single timescale, matches APN's default).
+
+\textbf{Hypotheses:}
+\begin{enumerate}
+\item GFR $K=1$ should train $\approx$1.5$\times$ faster than APN with comparable or slightly lower accuracy (simpler state cannot do delta-rule correction).
+\item GFR $K=4$ per-neuron may match or exceed APN by compensating the simpler recurrence with richer per-neuron temporal dynamics.
+\item GFR + FFN may avoid APN+FFN's memorization problem: the multi-slot memory provides diverse temporal features that the FFN can productively combine.
+\end{enumerate}
+
+Results will be added once experiments complete.
+
+% ============================================================================
 \section{Future Work}
 
 Based on these findings, several directions could improve APN's performance:
