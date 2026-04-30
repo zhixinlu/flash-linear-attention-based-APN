@@ -42,7 +42,7 @@ Comparing APAN, APN, GFR, DeltaNet, and Transformer Architectures}
 % ============================================================================
 \begin{abstract}
 We benchmark five sequence model architectures on the sequential CIFAR-10 task:
-the \textbf{APAN} (Associative Plasticity with Attractor Networks), the original Hebbian memory model using a pure attractor update;
+the \textbf{APAN} (Associative Plasticity Additive Networks), the original Hebbian memory model using an additive (attractor) update;
 the \textbf{APN} (Associative Plasticity Network), a prediction-error variant mapped onto the gated delta-rule Triton kernel;
 the \textbf{GFR} (Gated Forgetting Recurrence), a simplified element-wise gated scan model;
 \textbf{DeltaNet}, a delta-rule linear attention model; and a standard \textbf{softmax Transformer} with FlashAttention-2.
@@ -60,7 +60,7 @@ Key findings:
 % ============================================================================
 \section{Introduction}
 
-The Associative Plasticity with Attractor Networks (APAN) is a biologically-inspired recurrent model that maintains a Hebbian plastic memory matrix $M_t$, updated at every time-step using the layer's full output as the learning signal.
+The Associative Plasticity Additive Networks (APAN) is a biologically-inspired recurrent model that maintains a Hebbian plastic memory matrix $M_t$, updated at every time-step using the layer's full output (the \emph{additive} signal $\mathbf{v} + S^\top\mathbf{k}$) as the learning signal.
 The prediction-error variant (APN) replaces the Hebbian signal with a ``surprise'' signal.
 By mapping both recurrences onto the \emph{gated delta-rule} chunk kernel from the Flash Linear Attention (FLA) library, we achieve efficient GPU training with $O(TD)$ complexity instead of the $O(T^2 D)$ cost of standard softmax attention.
 
@@ -75,7 +75,7 @@ All models share the same outer wrapper:
 \texttt{Linear}(3 \to D) \;\to\; \tanh \;\to\; \underbrace{[\texttt{Layer}_i + \text{residual}]}_{i=1}^{L} \;\to\; \texttt{LayerNorm} \;\to\; \texttt{Linear}(D \to 10)
 \]
 
-\subsection{APAN Layer (Original: Associative Plasticity with Attractor Networks)}
+\subsection{APAN Layer (Associative Plasticity Additive Networks)}
 \label{sec:apan}
 
 The APAN implements the ``$W + M$'' principle in its purest Hebbian form.
@@ -171,31 +171,53 @@ The ``$W + M$'' interpretation is preserved: $W$ encodes innate/trained knowledg
 
 \subsection{GFR Layer (Gated Forgetting Recurrence)}
 
+\paragraph{Intuition.}
+GFR is a minimalist baseline that tests how much of APAN/APN's performance comes from its $D \times D$ matrix state (which can store associative key-value patterns) versus simple temporal memory.
+Each neuron maintains $K$ independent scalar memory slots, each decaying exponentially---no cross-neuron interaction, no outer products, no associative storage.
+If GFR approaches APAN/APN performance, then the matrix state is unnecessary; if there is a large gap, the associative capacity is proven essential.
+GFR uses the HGRN kernel (element-wise gated prefix scan), which is trivially parallel and extremely fast.
+
+\paragraph{Update rule.}
 Each GFR layer maintains $K$ scalar memory slots per neuron (total state: $D \cdot K$ scalars):
 \begin{equation}
 m_{i,k,t} = \lambda_k \, m_{i,k,t-1} + z_{i,t}, \quad
 h_{i,t} = z_{i,t} + \sum_{k=1}^{K} \eta_k \, m_{i,k,t}
 \end{equation}
-where $\mathbf{z}_t = W \cdot \text{act}(\mathbf{x}_t)$ is the projected input. This uses the HGRN chunk kernel (simple element-wise gated prefix scan).
+where $\mathbf{z}_t = W \cdot \text{act}(\mathbf{x}_t)$ is the projected input.
 
 \textbf{Parameters per layer:} $D^2$ (projection $W$) $+ 2K$ (scalars $\lambda, \eta$) $+ 2D$ (LayerNorm) $\approx D^2$.
 
 \subsection{DeltaNet Layer}
 
-DeltaNet uses separate Q/K/V projections with the (non-gated) delta rule:
+\paragraph{Intuition.}
+DeltaNet is a \emph{linear attention} model that maintains an associative memory via the delta rule---the same error-correcting update used in classical Widrow--Hoff learning.
+Unlike APAN/APN's single shared projection, DeltaNet decouples what to store ($V$), how to index it ($K$), and how to query it ($Q$) via separate linear projections, giving the model more representational flexibility at the cost of $3\times$ more parameters per layer.
+The input-dependent step size $\beta_t = \sigma(\cdot) \in (0,1)$ allows the model to selectively update: large $\beta$ for informative tokens, small $\beta$ for noise.
+
+\paragraph{Update rule.}
 \begin{equation}
 S_t = S_{t-1} + \beta_t \, \mathbf{k}_t \otimes \bigl(\mathbf{v}_t - S_{t-1}^\top \mathbf{k}_t\bigr), \quad \mathbf{o}_t = \mathbf{q}_t^\top S_t
 \end{equation}
 where $\beta_t = \sigma(W_\beta \mathbf{x}_t)$ is a learned, input-dependent step size.
+The delta-rule error signal $\mathbf{v}_t - S_{t-1}^\top \mathbf{k}_t$ ensures the memory converges toward storing the correct key-value association and is unconditionally stable (same as APN).
+DeltaNet uses the same \texttt{chunk\_gated\_delta\_rule} Triton kernel as APN/APAN, benefiting from the same GPU optimizations described in Section~\ref{sec:kernels}.
 
 \textbf{Parameters per layer:} $3D^2$ (Q/K/V projections) $+ D$ ($\beta$ projection) $+ 2D$ (LayerNorm) $\approx 3D^2$.
 
 \subsection{Transformer Layer}
 
-A pre-norm causal Transformer block with FlashAttention-2:
+\paragraph{Intuition.}
+The Transformer uses \emph{softmax attention} to compute all-pairs token interactions, allowing each position to attend to any previous position with learned importance weights.
+This gives maximal representational power but at $O(T^2)$ cost in sequence length.
+We include it as the gold-standard upper bound: if a linear-time model can approach the Transformer's accuracy, it validates the efficiency of recurrent state-space approaches.
+We use FlashAttention-2 for memory-efficient training, which avoids materializing the $T \times T$ attention matrix in HBM.
+
+\paragraph{Architecture.}
+A pre-norm causal Transformer block:
 \[
 \texttt{LN} \to \texttt{MHA} \to \text{residual} \to \texttt{LN} \to \texttt{FFN}(D \to 4D \to D) \to \text{residual}
 \]
+The FFN is \emph{integral} to the Transformer (unlike APAN/APN where it is optional and harmful); removing it would halve the model's capacity.
 
 \textbf{Parameters per layer:} $4D^2$ (QKV + output proj) $+ 8D^2$ (FFN) $+ 4D$ (two LayerNorms) $\approx 12D^2$.
 
@@ -357,6 +379,106 @@ APN & act=none, warmup20 & 100 & 1 & 103,630 & 58.34 & 189 & 58.17 & 0.17 & 25.5
 With only 105K parameters, APAN (RMSNorm) achieves \textbf{64.22\%} test accuracy---the highest among all $\sim$103K-parameter models, and competitive with the Transformer at 1.2M parameters (65.2\%).
 Per 1K parameters, APAN extracts 0.61\% accuracy, versus 0.56\% for the prediction-error APN, 0.58\% for DeltaNet, and only 0.053\% for the Transformer.
 
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+    xbar,
+    width=0.9\textwidth,
+    height=0.6\textwidth,
+    xlabel={Peak Test Accuracy (\%)},
+    xmin=40, xmax=67,
+    ytick=data,
+    yticklabels={
+        {APAN RMSNorm (105K)},
+        {Transformer H=4 (1.2M)},
+        {DeltaNet+FFN H=4 (1.2M)},
+        {Transformer H=1 (1.2M)},
+        {DeltaNet D=100 (305K)},
+        {DeltaNet+FFN H=1 (1.2M)},
+        {DeltaNet D=58 (104K)},
+        {Transformer D=29 (103K)},
+        {GFR+FFN (1.2M)},
+        {APN act=none (103K)},
+        {APAN+FFN RMSNorm (907K)},
+        {GFR+FFN D=34 (106K)},
+        {APN+FFN (1.2M)},
+        {APAN tanh (104K)},
+        {GFR K=4 (104K)},
+        {GFR K=1 (104K)}
+    },
+    y tick label style={font=\scriptsize},
+    bar width=8pt,
+    grid=major,
+    grid style={gray!30, dashed},
+    title={\textbf{Summary: Peak Test Accuracy (All Models)}},
+    title style={font=\normalsize},
+    nodes near coords,
+    nodes near coords style={font=\tiny, anchor=west},
+    every axis plot/.append style={fill opacity=0.85},
+]
+\addplot[fill=apan-rmsnorm] coordinates {(64.22,16)};
+\addplot[fill=transformer] coordinates {(65.16,15)};
+\addplot[fill=deltanet-ffn] coordinates {(63.56,14)};
+\addplot[fill=transformer] coordinates {(63.50,13)};
+\addplot[fill=deltanet] coordinates {(62.28,12)};
+\addplot[fill=deltanet-ffn] coordinates {(62.80,11)};
+\addplot[fill=deltanet-pm] coordinates {(60.06,10)};
+\addplot[fill=transformer-pm] coordinates {(59.75,9)};
+\addplot[fill=gfr-ffn] coordinates {(58.93,8)};
+\addplot[fill=apn-none] coordinates {(58.34,7)};
+\addplot[fill=apan-rmsnorm!60] coordinates {(57.89,6)};
+\addplot[fill=gfr-ffn!60] coordinates {(57.57,5)};
+\addplot[fill=apn-ffn] coordinates {(56.84,4)};
+\addplot[fill=apan-tanh] coordinates {(56.42,3)};
+\addplot[fill=gfr-k4] coordinates {(56.00,2)};
+\addplot[fill=gfr-k1] coordinates {(53.57,1)};
+\end{axis}
+\end{tikzpicture}
+\caption{Summary of peak test accuracy across all models. \textbf{APAN RMSNorm (105K params)} achieves 64.2\%, outperforming models with $3$--$12\times$ more parameters (DeltaNet 305K, GFR+FFN 1.2M, APN+FFN 1.2M) and coming within 1 point of the Transformer at 1.2M.}
+\label{fig:summary_bar}
+\end{figure}
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+    width=0.85\textwidth,
+    height=0.55\textwidth,
+    xlabel={Epoch},
+    ylabel={Test Accuracy (\%)},
+    xmin=0, xmax=200,
+    ymin=35, ymax=66,
+    grid=major,
+    grid style={gray!30},
+    legend style={at={(0.98,0.02)}, anchor=south east, font=\footnotesize, draw=none, fill=white, fill opacity=0.8},
+    every axis plot/.append style={thick},
+    title={\textbf{All APAN Variants: RMSNorm vs.\ Tanh $\times$ FFN vs.\ No-FFN}},
+    title style={font=\normalsize},
+]
+
+\addplot[color=apan-rmsnorm, thick] table[x=epoch, y=test/acc, col sep=comma]
+    {../report_data/apan_L10_D100_rmsnorm_noFFN.csv};
+\addlegendentry{APAN RMSNorm, no FFN (105K) --- \textbf{64.2\%}}
+
+\addplot[color=apan-rmsnorm, thick, dashed] table[x=epoch, y=test/acc, col sep=comma]
+    {../report_data/apan_L10_D100_rmsnorm_FFN.csv};
+\addlegendentry{APAN RMSNorm + FFN (907K) --- 57.9\%}
+
+\addplot[color=apan-tanh, thick] table[x=epoch, y=test/acc, col sep=comma]
+    {../report_data/apan_L10_D100_tanh_noFFN.csv};
+\addlegendentry{APAN tanh, no FFN (104K) --- 56.4\%}
+
+\addplot[color=apan-tanh, thick, dashed] table[x=epoch, y=test/acc, col sep=comma]
+    {../report_data/apan_L10_D100_tanh_FFN.csv};
+\addlegendentry{APAN tanh + FFN (906K) --- 52.1\%}
+
+\end{axis}
+\end{tikzpicture}
+\caption{All four APAN variants. \textbf{Key observations:} (1)~RMSNorm keys dominate tanh keys (+7.8 points without FFN, +5.8 with FFN). (2)~FFN \emph{always hurts} APAN ($-6.3$ points for RMSNorm, $-4.3$ for tanh). (3)~The best APAN (RMSNorm, no FFN) at 105K params outperforms the worst APAN+FFN variant (tanh+FFN at 906K) by 12.1 points. The FFN enables 100\% train accuracy but causes catastrophic overfitting.}
+\label{fig:apan_variants}
+\end{figure}
+
 The comparison between APAN variants is illuminating:
 \begin{itemize}
 \item \textbf{APAN RMSNorm (64.22\%)}: The best. RMSNorm ensures $\|\mathbf{k}\|^2 = d$ exactly, giving the Hebbian update a consistent and well-scaled learning signal. The model does not reach 100\% train accuracy (76.6\%), indicating it is still learning rather than memorizing.
@@ -405,13 +527,21 @@ The result is a Hebbian memory that learns consistently across all sequence posi
     {../report_data/apn_L10_D115_H200_B64_ffn_warmup20_paramatch.csv};
 \addlegendentry{APN+FFN D=115 (1.2M)}
 
-\addplot[color=apn-none, thick, dashed] table[x=epoch, y=test/acc, col sep=comma]
-    {../report_data/apn_L10_D100_H200_B64_act-none_warmup20.csv};
-\addlegendentry{APN no-FFN D=100 (103K, reference)}
+\addplot[color=apan-rmsnorm, thick, dashed] table[x=epoch, y=test/acc, col sep=comma]
+    {../report_data/apan_L10_D100_rmsnorm_FFN.csv};
+\addlegendentry{APAN+FFN RMSNorm (907K)}
+
+\addplot[color=apan-tanh, thick, dashed] table[x=epoch, y=test/acc, col sep=comma]
+    {../report_data/apan_L10_D100_tanh_FFN.csv};
+\addlegendentry{APAN+FFN tanh (906K)}
+
+\addplot[color=apan-rmsnorm, thick, dotted] table[x=epoch, y=test/acc, col sep=comma]
+    {../report_data/apan_L10_D100_rmsnorm_noFFN.csv};
+\addlegendentry{APAN no-FFN RMSNorm (105K, reference)}
 
 \end{axis}
 \end{tikzpicture}
-\caption{FFN-augmented models at $\approx$1.2M params. DeltaNet+FFN (62.8\%) nearly matches the Transformer (63.5\%). GFR+FFN (58.9\%) benefits from the FFN. Remarkably, APN+FFN (56.8\%, solid dark red) \emph{underperforms} plain APN without FFN (58.3\%, dashed red) despite having 12$\times$ more parameters.}
+\caption{FFN-augmented models. DeltaNet+FFN (62.8\%) nearly matches the Transformer (63.5\%). GFR+FFN (58.9\%) benefits. Both APAN+FFN variants (dashed purple, 57.9\% and 52.1\%) \emph{underperform} plain APAN without FFN (dotted purple, 64.2\%)---the FFN enables memorization (100\% train acc) but destroys generalization. APN+FFN (56.8\%) also loses to plain APN (58.3\%).}
 \label{fig:ffn}
 \end{figure}
 
@@ -1145,12 +1275,18 @@ Models in this group are capacity-limited and generally do not reach 100\% train
     xlabel={Epoch},
     ylabel={Test Accuracy (\%)},
     xmin=0, xmax=200,
-    ymin=30, ymax=62,
+    ymin=30, ymax=66,
     grid=major,
     grid style={gray!30},
     legend style={at={(0.98,0.02)}, anchor=south east, font=\tiny, draw=none, fill=white, fill opacity=0.8},
     every axis plot/.append style={thick},
 ]
+\addplot[color=apan-rmsnorm, thick] table[x=epoch, y=test/acc, col sep=comma]
+    {../report_data/apan_L10_D100_rmsnorm_noFFN.csv};
+\addlegendentry{APAN RMSNorm (64.2\%)}
+\addplot[color=apan-tanh, thick] table[x=epoch, y=test/acc, col sep=comma]
+    {../report_data/apan_L10_D100_tanh_noFFN.csv};
+\addlegendentry{APAN tanh (56.4\%)}
 \addplot[color=apn-none, thick] table[x=epoch, y=test/acc, col sep=comma]
     {../report_data/apn_L10_D100_H200_B64_act-none_warmup20.csv};
 \addlegendentry{APN none (58.3\%)}
