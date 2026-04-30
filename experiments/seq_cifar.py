@@ -763,8 +763,10 @@ def main():
                 if model_name == 'gfr':
                     for i, layer in enumerate(model.layers):
                         for k in range(layer.n_slots):
-                            log_dict[f'gfr/eta_layer{i}_slot{k}'] = layer.eta[k].item()
-                            log_dict[f'gfr/lam_layer{i}_slot{k}'] = layer.lam[k].item()
+                            eta_k = layer.eta[:, k].mean() if layer.per_neuron_eta else layer.eta[k]
+                            lam_k = layer.lam[:, k].mean() if layer.per_neuron_lam else layer.lam[k]
+                            log_dict[f'gfr/eta_layer{i}_slot{k}'] = eta_k.item()
+                            log_dict[f'gfr/lam_layer{i}_slot{k}'] = lam_k.item()
                 wandb.log(log_dict, step=epoch)
 
             # --- Save best model ---
