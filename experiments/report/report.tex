@@ -298,6 +298,7 @@ APN+FFN & $H{=}4$, per-head & 116 & 4 & 1,217,626 & 40.58$^\dagger$ & 9 & 10.00 
 \multicolumn{10}{l}{\textit{Group 2: $\approx$103K params (no FFN, parameter-matched)}} \\
 \midrule
 \textbf{APAN} & \textbf{RMSNorm keys, act=none} & 100 & 1 & 104,630 & \textbf{64.22} & $\sim$190 & 63.96 & 0.26 & $\sim$25 \\
+APAN & RMSNorm keys, $H{=}4$ & 100 & 4 & 104,690 & 62.28 & $\sim$155 & 58.09 & 4.19 & 28.3 \\
 DeltaNet & param-match & 58 & 1 & 103,598 & 60.06 & 18 & 55.40 & 4.66 & 69.0 \\
 Transformer & param-match, warmup20 & 29 & 1 & 102,554 & 59.75 & 38 & 55.89 & 3.86 & 32.6 \\
 APN & act=none, warmup20 & 100 & 1 & 103,630 & 58.34 & 189 & 58.17 & 0.17 & 25.5 \\
@@ -568,16 +569,26 @@ In contrast, GFR's simpler element-wise recurrence produces features that the FF
     {../report_data/deltanet_L10_D104_H200_B64_ffn_warmup20_paramatch.csv};
 \addlegendentry{DeltaNet+FFN H=1 (62.8\%)}
 
+\addplot[color=apan-rmsnorm, thick] table[x=epoch, y=test/acc, col sep=comma]
+    {../report_data/apan_L10_D100_H4_rmsnorm_noFFN.csv};
+\addlegendentry{APAN H=4 (62.3\%)}
+
+\addplot[color=apan-rmsnorm, thick, dashed] table[x=epoch, y=test/acc, col sep=comma]
+    {../report_data/apan_L10_D100_rmsnorm_noFFN.csv};
+\addlegendentry{APAN H=1 (64.2\%)}
+
 \end{axis}
 \end{tikzpicture}
-\caption{Multi-head ($H{=}4$) vs.\ single-head. Transformer improves from 63.5\% to 65.2\% (+1.7 points). DeltaNet+FFN improves from 62.8\% to 63.6\% (+0.8 points). APN $H{=}4$ diverges to NaN and is not shown (see text).}
+\caption{Multi-head ($H{=}4$) vs.\ single-head. Transformer improves from 63.5\% to 65.2\% (+1.7 points). DeltaNet+FFN improves from 62.8\% to 63.6\% (+0.8 points). However, \textbf{APAN H=4 (62.3\%) is worse than APAN H=1 (64.2\%)} by 1.9 points---multi-head splits the $D{\times}D$ memory into $H$ smaller $25{\times}25$ matrices, reducing associative capacity. APN $H{=}4$ diverges to NaN (not shown).}
 \label{fig:multihead}
 \end{figure}
 
 Multi-head attention ($H{=}4$) benefits the Transformer (+1.66 points, from 63.50\% to 65.16\%) and DeltaNet+FFN (+0.76 points, from 62.80\% to 63.56\%).
-However, \textbf{both multi-head APN runs diverged completely}:
+However, \textbf{multi-head hurts APAN}: APAN $H{=}4$ achieves 62.28\% peak (vs.\ 64.22\% for $H{=}1$), a \textbf{$-$1.94 point} drop.
+Meanwhile, \textbf{both multi-head APN runs diverged completely}:
 
 \begin{itemize}
+\item \textbf{APAN $H{=}4$ RMSNorm} ($D{=}100$): Trains stably (tanh $\eta$ prevents divergence) but peaks at 62.28\% and overfits significantly (final: 58.09\%, drop = 4.19 points, train acc: 96.8\%). The 4 heads each operate on a $25{\times}25$ state matrix---less expressive than a single $100{\times}100$ matrix. Interestingly, several heads learn \emph{negative} $\eta$ (anti-Hebbian): layer~0 heads 0,1,2 have $\eta \approx -0.5, -0.6, -1.0$; layer~5 head~0 has $\eta = -0.98$. This suggests the model uses some heads for active forgetting.
 \item \textbf{APN $H{=}4$ without FFN} ($D{=}100$): NaN from epoch 1. All scalars immediately become NaN.
 \item \textbf{APN $H{=}4$ with FFN} ($D{=}116$): Trains for 9 epochs (peak 40.6\% at epoch 9), then NaN at epoch 10. The scalar logs reveal that head~3's $\eta$ (initialized at 0.1) \emph{goes negative} ($-0.12$ at epoch 9), causing the Hebbian update to amplify rather than correct errors. Meanwhile, head~0's $\eta$ (initialized at 1.0 with $\lambda{=}0.999$) grows unboundedly ($1.08$ at epoch 9).
 \end{itemize}
@@ -590,8 +601,15 @@ The Hebbian outer-product update $\mathbf{k}_t \otimes (\mathbf{v}_t - S_{t-1}^\
 For the no-FFN variant, the $25{\times}25$ state is so small that the system is unstable from the first gradient step.
 These issues do not affect DeltaNet because its $\beta_t = \sigma(\cdot) \in (0,1)$ is always positive and bounded.
 
-\textbf{APAN's solution.} The APAN architecture addresses this with two mechanisms: (1)~$\eta = \tanh(\hat\eta) \in (-1, 1)$ is bounded by construction---it cannot diverge; (2)~RMSNorm key normalization ensures $\|\mathbf{k}\|^2 = d$ exactly, making the stability condition $|\alpha| = |\lambda + \eta(1-\lambda)| < 1$ hold unconditionally for any $\eta \in (-1,1)$ and $\lambda \in (0,1)$.
-This enables safe multi-head deployment, though we leave multi-head APAN experiments to future work.
+\textbf{APAN's solution.} The APAN architecture addresses the NaN problem with two mechanisms: (1)~$\eta = \tanh(\hat\eta) \in (-1, 1)$ is bounded by construction---it cannot diverge; (2)~RMSNorm key normalization ensures $\|\mathbf{k}\|^2 = d$ exactly, making the stability condition $|\alpha| = |\lambda + \eta(1-\lambda)| < 1$ hold unconditionally for any $\eta \in (-1,1)$ and $\lambda \in (0,1)$.
+APAN $H{=}4$ confirms this: it trains stably for all 200 epochs with no NaN.
+However, stability $\ne$ optimality: splitting the $100{\times}100$ state into four $25{\times}25$ matrices reduces the rank of each head's memory from 100 to 25, limiting its ability to store complex associations.
+The result is a model that overfits more (96.8\% train, 4.2-point drop) and generalizes less (62.3\% vs.\ 64.2\%).
+
+\textbf{Why multi-head hurts APAN but helps the Transformer.}
+The Transformer benefits from multiple heads because each head attends to different parts of the sequence (different ``what to attend to'' patterns), and the FFN combines their outputs.
+APAN's $D{\times}D$ matrix state stores associative memories; splitting it into $H$ smaller matrices reduces the capacity of each memory without a mechanism to combine them constructively.
+At $D=100, H=4$, each head has a $25{\times}25$ matrix with rank at most 25---a $4\times$ reduction in representational capacity compared to the single-head $100{\times}100$ matrix.
 
 % ============================================================================
 \subsection{Key Finding 4: GFR Validates the Importance of APN's Matrix State}
